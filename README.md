@@ -168,7 +168,7 @@ private (0700) and its files 0600. Delete the directory to start over.
 credential-shaped tokens masked before it is cut (in tool arguments, each value is masked before it is written as JSON). |
 | `failures-seen.jsonl` | one row per program per session already sent to the failure judge: a hash of the session id and a hash of the program name. A program is marked when it is sent, so if every judge slot was busy it is not judged again that session. It grows by a row per new program per session and is not trimmed (only the last 2000 rows are read). |
 | `hindsight-seen.jsonl` | one row per reply already sent to the hindsight judge (hashes only), so a reply is judged once |
-| `ast-fired.json` | which structural findings each recent session has already been shown |
+| `ast-fired.json` | which structural findings each recent session has already been shown, as hashes of the file path, check and source line (no source text) |
 | `dismissed.txt` | ids of corrections you dismissed |
 | `inbox/` | corrections waiting to be announced; each is removed once announced or closed. A session that ends before its next tool call leaves its file behind; `lesson pending` still lists the correction. |
 | `fired.json` | which lessons have already fired, for the 256 most recent entries (a session's main thread and each subagent are separate entries) |
@@ -183,19 +183,21 @@ one per newly failing program -- and nothing trims it.
 (`redact`, `mask`, `scrub`, `sanitize`, `anonymize`, `mask_secrets`), so a credential straddling the cut becomes a
 fragment too short to recognise and is stored or sent. It follows the value through local names, lists it is
 appended to, tuple unpacking, loop and comprehension variables, and functions that return cut text, within one
-file. Each function, lambda and comprehension is its own scope: it sees what its enclosing scope had bound where it
-is defined, and its own parameters shadow that. A use sees only what was bound before it, except inside a loop, where
-a cut made later in the loop reaches the next pass. That bug recurred five times while this plugin was being built,
+file. Each function, lambda, comprehension and class body is its own scope. A function, lambda or comprehension sees
+what its enclosing function or module had bound where it is defined (a class body's names are not visible to the
+methods inside it, as in Python), and its own parameters or loop variables shadow that; a comprehension's first
+iterable is read in the scope around it. A use sees only what was bound before it, except inside a loop, where a cut
+made later in the loop reaches the next pass. That bug recurred five times while this plugin was being built,
 which is why it is the first.
 
 It is a heuristic over one file, and it is wrong both ways:
 - **False positives:** any function named like a masker counts, so a `mask()` that formats a card number for
   display, fed its last four digits, is flagged (the one finding across 548 of the author's Python files).
-  `df.mask(df[:5] > 0)` is flagged too. It errs toward flagging: clean text assigned to a name inside an `if`, a loop
+  `df.mask(df[:5] > 0)` is flagged too. It errs toward flagging: clean text assigned to a name inside an `if`, a loop,
   a `try` or a `with` does not clear it, because another path may still carry the cut text.
 - **False negatives:** cuts made in another module or by a library (`textwrap.shorten`), cuts that reach the masker
-  through an object attribute or a dict entry, walrus assignments, and a name a function reads that is cut only
-  after the function is defined, are not followed. To add a check, write a function from source text to
+  through an object attribute or a dict entry, walrus assignments, a name a function reads that is cut only
+  after the function is defined, and a cut passed through a decorator or a default argument, are not followed. To add a check, write a function from source text to
 `[(line, message)]` and add it to `CHECKS`. Run it directly with `python3 hooks/ast_lessons.py check FILE...`.
 
 ## Prior art

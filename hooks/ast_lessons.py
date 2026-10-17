@@ -15,6 +15,7 @@ To add a check: write a function source -> [(line, message)] and add it to CHECK
   python3 ast_lessons.py --selftest
 """
 import ast
+import bisect
 import sys
 
 
@@ -119,8 +120,15 @@ def _taint_at(timeline, upto, initial):
     return states[k - 1] if k else frozenset(initial)
 
 
+def _ordered(scope):
+    """(nodes of SCOPE in source order, their positions) -- built once per scope and reused, so a pass over one loop
+    costs that loop, not the whole scope (the re-audit: 400 loops took 4 s re-sorting the scope per loop)."""
+    nodes = sorted((n for n in _own_nodes(scope) if hasattr(n, "lineno")), key=_pos)
+    return nodes, [_pos(n) for n in nodes]
+
+
 def _scope_taint(scope: ast.AST, slicers: set[str], upto=None, initial=frozenset(), clear=True,
-                 record=None, since=None) -> set[str]:
+                 record=None, since=None, ordered=None) -> set[str]:
     """The names in SCOPE that may hold cut text at position UPTO (the whole scope when None), in source order:
     plain, annotated and augmented assignment, loop and comprehension variables (bound from what they iterate over),
     and a list a cut value is appended or extended into. A use only sees bindings before it.
@@ -137,8 +145,9 @@ def _scope_taint(scope: ast.AST, slicers: set[str], upto=None, initial=frozenset
                 tainted |= set(_bound_names(g.target))
     if record is not None:  # the state on entry (a comprehension's variables are bound before its body runs)
         record((0, -1), tainted)
-    nodes = sorted((n for n in _own_nodes(scope) if hasattr(n, "lineno")), key=_pos)
-    for n in nodes:
+    nodes, positions = ordered or _ordered(scope)
+    first = bisect.bisect_left(positions, since) if since is not None else 0  # a loop's pass starts at the loop
+    for n in nodes[first:]:
         if upto is not None and _pos(n) >= upto:
             break
         if since is not None and _pos(n) < since:
@@ -203,12 +212,17 @@ def slice_into_redact(src):
         return up if up is not None else tree
 
     cache: dict = {}
+    order_cache: dict = {}
 
-    def timeline(scope, clear):
-        key = (id(scope), clear)
-        if key not in cache:
-            cache[key] = _timeline(scope, slicers, initial=inherited(scope), clear=clear)
-        return cache[key]
+    def ordered(scope):
+        if id(scope) not in order_cache:
+            order_cache[id(scope)] = _ordered(scope)
+        return order_cache[id(scope)]
+
+    def timeline(scope):
+        if id(scope) not in cache:
+            cache[id(scope)] = _timeline(scope, slicers, initial=inherited(scope))
+        return cache[id(scope)]
 
     def params(scope):
         """Names a scope binds before its body runs -- a function's or lambda's parameters, a comprehension's
@@ -232,7 +246,18 @@ def slice_into_redact(src):
             return frozenset()
         if id(scope) not in inherit_cache:
             outer = enclosing(scope)
-            inherit_cache[id(scope)] = frozenset(seen_at(outer, scope) - params(scope))
+            seen = frozenset(seen_at(outer, scope) - params(scope))
+            if isinstance(scope, COMPS):
+                # Python evaluates a comprehension's FIRST iterable in the scope around it -- a class body included
+                # -- before its own variables exist (the re-audit: `[mask(line) for line in line.splitlines()]`
+                # after `line = text[:500]`, and `[redact(x) for x in t]` in a class body, were both missed)
+                here = parent.get(scope)
+                while here is not None and not isinstance(here, SCOPES):
+                    here = parent.get(here)
+                g = scope.generators[0]
+                if _tainted(g.iter, slicers, seen_at(here if here is not None else tree, scope)):
+                    seen |= set(_bound_names(g.target))
+            inherit_cache[id(scope)] = seen
         return inherit_cache[id(scope)]
 
     def outer_loop(node, scope):
@@ -254,13 +279,13 @@ def slice_into_redact(src):
         start = inherited(scope)
         loop = outer_loop(node, scope)
         if loop is None:
-            return _taint_at(timeline(scope, True), _pos(node), start)
+            return _taint_at(timeline(scope), _pos(node), start)
         key = (id(scope), id(loop))
         if key not in loop_cache:
             end = (getattr(loop, "end_lineno", None) or loop.lineno, getattr(loop, "end_col_offset", None) or 0)
-            before = _taint_at(timeline(scope, True), _pos(loop), start)
+            before = _taint_at(timeline(scope), _pos(loop), start)
             loop_cache[key] = frozenset(_scope_taint(scope, slicers, upto=(end[0], end[1] + 1), initial=before,
-                                                     clear=False, since=_pos(loop)))
+                                                     clear=False, since=_pos(loop), ordered=ordered(scope)))
         return loop_cache[key]
 
     for scope in scopes:
@@ -346,6 +371,10 @@ def selftest():
              "        t = s[:9]\n") == [4])
     ck("class-body-name-not-seen-by-method",
        lines("t = 'ok'\n\nclass C:\n    t = s[:9]\n\n    def m(self):\n        return redact(t)\n") == [])
+    ck("comprehension-first-iterable-is-the-enclosing-scopes",
+       lines("def f(text):\n    line = text[:500]\n    return [mask(line) for line in line.splitlines()]\n") == [3])
+    ck("comprehension-in-class-body-iterates-the-class-name",
+       lines("class C:\n    t = s[:9]\n    ys = [redact(x) for x in t]\n") == [3])
     ck("class-body-call-checked", lines("class C:\n    t = s[:9]\n    u = redact(t)\n") == [3])
     ck("lambda-sees-enclosing-taint", lines("def f(p):\n    t = p[:600]\n    g = lambda: redact(t)\n"
                                             "    return g\n") == [3])

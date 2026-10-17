@@ -7,6 +7,7 @@ with Edit/MultiEdit's replacements applied), runs ast_lessons' checks, and shows
 not already have -- once per session. It never blocks. Python files only: *.py, or an extensionless script whose
 first line is a python shebang.
 """
+import hashlib
 import json
 import os
 import sys
@@ -99,7 +100,9 @@ def handle(ev, check=None, state_path=None, read=_read):
             state = {}
         fired = set(state.get(session) or [])
         for c, ln, m, text in found:
-            key = f"{path}|{c}|{text}"
+            # hashed: the key names a source line, and a source line can hold a credential (the re-audit wrote
+            # `redact("sk-ant-..."[:12])` and found the literal key in this file)
+            key = hashlib.sha256(f"{path}|{c}|{text}".encode()).hexdigest()[:32]
             if key in fired:
                 continue
             fired.add(key)

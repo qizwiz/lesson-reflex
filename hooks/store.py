@@ -113,17 +113,40 @@ def locked(name="state.lock"):
 HEX = frozenset("0123456789abcdefABCDEF")
 
 
+ESCAPE_WIDTH = {"x": 2, "u": 4, "U": 8}
+
+
+def escape_end(text, j):
+    """PURE: where the escape whose letter is at TEXT[j] (just after a backslash) ends: \\x + 2 hex digits, \\u + 4,
+    \\U + 8, octal up to 3 digits, else one key character. Punctuation (`\\"`) is no escape letter: returns j."""
+    if j >= len(text):
+        return j
+    if text[j] in ESCAPE_WIDTH:
+        k = j + 1
+        while k < len(text) and k <= j + ESCAPE_WIDTH[text[j]] and text[k] in HEX:
+            k += 1
+        return k
+    if text[j] in "01234567":
+        k = j
+        while k < len(text) and k < j + 3 and text[k] in "01234567":
+            k += 1
+        return k
+    return j + 1 if text[j] in KEY else j
+
+
 def at_boundary(text, i):
-    """PURE: can a token start at TEXT[i]? At the start, after a non-key character, or right after a backslash escape
-    written out as text -- `\\n`, `\\t`, `\\xHH`, `\\uXXXX` -- whose last character is a letter or digit that
-    would otherwise read as part of the key (the final audit: `printf 'K\\nsk-ant-...'` and JSON text kept the key)."""
+    """PURE: can a token start at TEXT[i]? At the start, after a non-key character, or right where ANY backslash
+    escape written out as text ends -- `\\n`, `\\a`, `\\033`, `\\x1b`, `\\u00e9`, `\\U0001F600`, `\\_` -- whose last
+    character would otherwise read as part of the key. Three audit rounds found these one family at a time; the tests
+    now sweep every escape a backslash can start."""
     if i == 0 or text[i - 1] not in KEY:
         return True
-    if i >= 2 and text[i - 2] == "\\":
-        return True
-    if i >= 4 and text[i - 4:i - 2] == "\\x" and all(c in HEX for c in text[i - 2:i]):
-        return True
-    return i >= 6 and text[i - 6:i - 4] in ("\\u", "\\U") and all(c in HEX for c in text[i - 4:i])
+    for k in range(i - 1, max(-1, i - 11), -1):
+        # any reading of the escape: its letter alone, any part of its digit run, or all of it -- a key's first
+        # letters can look like hex digits (`\\xAKIA...`, `\\u00AKIA...` must not lose their A)
+        if text[k] == "\\" and k + 2 <= i <= escape_end(text, k + 1):
+            return True
+    return False
 
 
 def carries_secret(text):
