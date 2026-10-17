@@ -209,6 +209,16 @@ class Pure(unittest.TestCase):
             for f in fronts:
                 self.assertNotIn(k[:12], store.mask("x" + f + k), (f, k[:6]))
                 self.assertTrue(store.carries_secret("x" + f + k), (f, k[:6]))
+        # every family, glued, and a body with no digit (the fifth audit: sk-svcacct-, sk-admin-, sk-None- were lost
+        # when the generic sk- stopped at the hyphen; QA in-house: sk_test_ dropped, digit-free keys passed)
+        for prefix, allowed, _minimum, _exact in store.SECRET_SHAPES:
+            body = "Q3EGR7WZ5LXHJ2PN" if allowed is store.UPPER_DIGITS else "AbcDef" * 7
+            self.assertTrue(store.carries_secret("x" + prefix + body), prefix)
+            self.assertNotIn(prefix + body[:8], store.mask("%20" + prefix + body), prefix)
+        self.assertTrue(store.carries_secret("x" + "AK" + "IA" + "IOSFODNN7EXAMPLE2"), "an AWS id with a longer run")
+        for word in ("num_highs_in_window_last_30_days", "def test_task_test_fixture_2024_case():",
+                     "network_live_stream_v2_status", "mask_test_value_1234567890"):
+            self.assertFalse(store.carries_secret(word), word)
         legacy = "sk-" + "Ab1" * 12
         for f in ("%20", "\x1b[0m", "0", "Z", "_"):
             self.assertNotIn(legacy[:12], store.mask("x" + f + legacy), f)

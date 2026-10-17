@@ -21,21 +21,26 @@ import time
 
 TOOLS = ("Bash", "Edit", "MultiEdit", "Write")
 KEEP_SESSIONS = 256  # entries: a session's main thread and each of its subagents count separately
-# Credential shapes: (prefix, characters allowed after it, minimum count). The prefix must start a token (start of
-# text or after a non-key character), so "flask-sqlalchemy" is not "sk-...". A lesson is read back into every matching
-# session, so it must never carry one. Facts about shape, not a guarantee: describe secrets, never paste them.
+# Credential shapes, found by shape alone wherever they start (see key_spans). A lesson is read back into every
+# matching session, so it must never carry one. Facts about shape, not a guarantee: describe secrets, never paste them.
 KEY = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 UPPER_DIGITS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-# (prefix, allowed characters, minimum length, exact length or 0). Generated keys contain digits, so a tail with no
-# digit ("sk-learn-compatible-estimator") is a name, not a key. AWS key ids are exactly 16 characters after the prefix.
+ALNUM = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+ALNUM_U = ALNUM | {"_"}
+# (prefix, allowed characters, minimum length, exact length or 0). A body needs a digit or mixed case
+# ("sk-learn-compatible-estimator" is a name: lowercase, and its run stops at the hyphen); AWS ids, one case only, don't.
 SECRET_SHAPES = (
-    ("ghp_", KEY, 20, 0), ("gho_", KEY, 20, 0), ("ghs_", KEY, 20, 0), ("github_pat_", KEY, 20, 0),  # GitHub
-    ("sk-ant-", KEY, 20, 0), ("sk-proj-", KEY, 20, 0), ("sk-", KEY, 20, 0),  # Anthropic / OpenAI
-    ("sk_live_", KEY, 16, 0), ("sk_test_", KEY, 16, 0), ("rk_live_", KEY, 16, 0),  # Stripe
-    ("xoxb-", KEY, 16, 0), ("xoxp-", KEY, 16, 0), ("xoxa-", KEY, 16, 0), ("xoxr-", KEY, 16, 0),  # Slack
-    ("glpat-", KEY, 16, 0),  # GitLab
-    ("AKIA", UPPER_DIGITS, 16, 16), ("ASIA", UPPER_DIGITS, 16, 16),  # AWS access key ids
-    ("AIza", KEY, 30, 0),  # Google API keys
+    ("ghp_", ALNUM, 36, 0), ("gho_", ALNUM, 36, 0), ("ghu_", ALNUM, 36, 0), ("ghs_", ALNUM, 36, 0),  # GitHub
+    ("ghr_", ALNUM, 36, 0), ("github_pat_", ALNUM_U, 22, 0),
+    ("AKIA", UPPER_DIGITS, 16, 0), ("ASIA", UPPER_DIGITS, 16, 0),  # AWS access key ids (16 or more)
+    ("xoxb-", KEY, 10, 0), ("xoxa-", KEY, 10, 0), ("xoxp-", KEY, 10, 0), ("xoxr-", KEY, 10, 0),  # Slack
+    ("xoxs-", KEY, 10, 0), ("xapp-", KEY, 10, 0),
+    ("sk-proj-", ALNUM, 32, 0), ("sk-svcacct-", ALNUM, 32, 0), ("sk-admin-", ALNUM, 32, 0),  # OpenAI
+    ("sk-None-", ALNUM, 32, 0), ("sk-", ALNUM, 32, 0),
+    ("sk_test_", ALNUM, 20, 0), ("rk_test_", ALNUM, 20, 0),  # Stripe test
+    ("glpat-", KEY, 20, 0), ("shpat_", ALNUM, 32, 0), ("AIza", KEY, 35, 0), ("sk-ant-", KEY, 24, 0),  # GitLab etc.
+    ("gsk_", ALNUM, 40, 0), ("sk_live_", ALNUM, 20, 0), ("rk_live_", ALNUM, 20, 0), ("hf_", ALNUM, 30, 0),
+    ("npm_", ALNUM, 36, 0), ("ya29.", KEY, 20, 0),  # Groq, Stripe live, Hugging Face, npm, Google OAuth
 )
 
 
@@ -110,7 +115,6 @@ def locked(name="state.lock"):
         os.close(fd)
 
 
-ALNUM = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 GENERIC = {"sk-": 32}  # prefix ordinary words end in -> the run of letters and digits a real key has after it
 MAX_KEY = 512  # no key is longer; a longer run is masked up to here and the rest left as text
 
@@ -147,15 +151,16 @@ def key_spans(text):
     digit, upper, lower = _next(text, str.isdigit), _next(text, str.isupper), _next(text, str.islower)
     spans = []
     for prefix, allowed, minimum, exact in SECRET_SHAPES:
-        if prefix in GENERIC:
-            allowed = ALNUM
         run = runs.setdefault(id(allowed), _runs(text, allowed))
         start = text.find(prefix)
         while start >= 0:
             p = start + len(prefix)
             n = min(run[p], MAX_KEY)
-            ok = n == exact if exact else n >= minimum
-            ok = ok and digit[p] < p + n
+            if allowed is UPPER_DIGITS:  # AWS: exactly 16, or a longer run whose first 16 hold a digit
+                ok = n == minimum or (n > minimum and digit[p] < p + minimum)  # not ASIAPACIFICREGIONSOUTH2
+            else:  # a digit, or mixed case, in the body (a digit-free key is rare, not impossible)
+                ok = (n == exact if exact else n >= minimum) and (
+                    digit[p] < p + n or (upper[p] < p + n and lower[p] < p + n))
             if ok and prefix in GENERIC:
                 ok = n >= GENERIC[prefix] and upper[p] < p + n and lower[p] < p + n
             if ok:
@@ -178,7 +183,7 @@ def carries_secret(text):
 def mask_values(obj):
     """PURE: OBJ with every string VALUE inside it masked (dictionary keys are left as they are) -- for structured input (tool arguments) that is about to become
     JSON. Masking after json.dumps misses a key on its own line: the newline becomes the two characters \\n, and the
-    n before the key is a key character, so the token has no boundary."""
+    escape could hide the key from a reader that needs a boundary before it (this masker no longer does; see key_spans)."""
     if isinstance(obj, str):
         return mask(obj)
     if isinstance(obj, dict):
@@ -189,8 +194,8 @@ def mask_values(obj):
 
 
 def mask(text):
-    """PURE: mask_once until nothing changes -- a replacement can create a token boundary that was not there before
-    (an ASIA... key directly followed by an sk-... key), so one pass can leave a recognisable key behind."""
+    """PURE: mask_once until nothing changes -- a cheap guard: key_spans finds every key in one pass, so a second pass
+    should find nothing, and this loop makes sure of it."""
     prev, out = None, text or ""
     while out != prev:
         prev, out = out, mask_once(out)

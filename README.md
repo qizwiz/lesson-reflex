@@ -69,12 +69,14 @@ lesson rm TOOL NEEDLE
 - a needle under 4 characters
 - a lesson under 20 characters
 - a duplicate
-- any field containing a token that starts with a known credential prefix (GitHub, Anthropic/OpenAI, Stripe, Slack,
-  GitLab, AWS key ids, Google keys) and continues like a generated key (long enough, with digits)
+- any field containing a token that starts with a known credential prefix (GitHub, Anthropic, OpenAI, Stripe, Slack,
+  GitLab, Shopify, AWS key ids, Google keys and OAuth tokens, Groq, Hugging Face, npm) and continues like a generated
+  key (long enough, with a digit or mixed case)
 
 The same shapes decide what is masked everywhere else. A key is recognised by its shape alone, whatever comes before
 it (an escape like `\n`, `%20`, a terminal colour code), so a known prefix inside a longer word is masked too:
-`C:\ask-proj-12345678901234567890` becomes `C:\a<secret>`. The generic OpenAI `sk-` counts only when 32 or more
+`C:\ask-proj-12345678901234567890` becomes `C:\a<secret>`. A body needs a digit or mixed case, and the prefixes
+that allow `_` stop at it, so snake_case names (`num_highs_in_window_last_30_days`) are left alone. The generic OpenAI `sk-` counts only when 32 or more
 letters and digits mixing upper case, lower case and digits follow, so `risk-assessment-2024` is left alone. That
 check catches common key shapes, not every secret. A lesson is read back into later sessions, so describe a secret's
 shape, never its value.
