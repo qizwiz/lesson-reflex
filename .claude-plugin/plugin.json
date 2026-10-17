@@ -1,6 +1,6 @@
 {
   "name": "lesson-reflex",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Turn a correction into a lesson that fires at the ACTION that caused it: a background judge spots when you correct Claude, Claude records a (tool, trigger text, lesson) row, and a PreToolUse hook injects it the next time Claude is about to do that thing.",
   "author": { "name": "qizwiz" },
   "license": "MIT"

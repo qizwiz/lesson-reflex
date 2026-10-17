@@ -26,6 +26,14 @@ MINT = (
     "--lesson 'what to do instead, and what the mistake cost' --source correction:{cid}\n"
     "If it was not a correction: python3 {cli} dismiss {cid}"
 )
+FAILURE_MINT = (
+    "[lesson-reflex] A tool call you made failed, and the judge reads it as YOUR mistake (failure {cid}; the action: "
+    "{prompt!r}). Find the fix first; then record what would have prevented it, so it fires next time at that "
+    "action.\nTOOL is one of Bash, Edit, MultiEdit, Write:\n"
+    "  python3 {cli} add --tool TOOL --needle 'TEXT IN THAT ACTION' "
+    "--lesson 'what to do instead, and what the mistake cost' --source correction:{cid}\n"
+    "If it was not a mistake: python3 {cli} dismiss {cid}"
+)
 HINDSIGHT_MINT = (
     "[lesson-reflex] What followed shows your PREVIOUS reply was wrong (hindsight {cid}; it ended: {prompt!r}). "
     "In one line, say what was wrong and fix it if it still matters. Then record the lesson so it fires next time at "
@@ -80,9 +88,11 @@ def build(tool, text, lessons, corrections, fired, inbox, dismissed=frozenset())
         key = "correction:" + cid
         if key in now or cid in closed or cid not in by_id:
             continue
-        template = HINDSIGHT_MINT if by_id[cid].get("kind") == "hindsight" else MINT
-        out.append(template.format(cli=shlex.quote(CLI), cid=cid, prompt=str(by_id[cid].get("prompt", ""))[-160:]
-                                   if by_id[cid].get("kind") == "hindsight" else str(by_id[cid].get("prompt", ""))[:160]))
+        kind = by_id[cid].get("kind")
+        template = {"hindsight": HINDSIGHT_MINT, "failure": FAILURE_MINT}.get(kind, MINT)
+        text = str(by_id[cid].get("prompt", ""))
+        out.append(template.format(cli=shlex.quote(CLI), cid=cid,
+                                   prompt=text[-160:] if kind == "hindsight" else text[:160]))
         now.add(key)
     for r in store.matching(tool, text, lessons):
         key = r["tool"] + ":" + r["needle"]

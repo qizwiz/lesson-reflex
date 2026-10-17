@@ -17,6 +17,8 @@ _HOME = tempfile.TemporaryDirectory()
 os.environ["LESSON_REFLEX_HOME"] = os.path.join(_HOME.name, "home")
 import capture  # noqa: E402
 import hindsight  # noqa: E402
+import failure  # noqa: E402
+import ast_lessons  # noqa: E402
 import judge  # noqa: E402
 import reflex  # noqa: E402
 import store  # noqa: E402
@@ -70,6 +72,32 @@ class Pure(unittest.TestCase):
             with open(p, "w") as fh:
                 fh.write('{bad\n{"a": 1}\n\n[1]\n{"b": 2}\n')
             self.assertEqual(store.read_jsonl(p), [{"a": 1}, {"b": 2}])
+
+    def test_mask_then_cut(self):
+        self.assertEqual(store.mask("use " + TOKEN + " now"), "use <secret> now")
+        self.assertEqual(store.mask("sk-learn-compatible-estimator"), "sk-learn-compatible-estimator")
+        row = judge.record({"kind": "failure", "session": "F", "action": "x" * 590 + " " + TOKEN, "error": "e",
+                            "program": "curl"}, "mistake")
+        self.assertNotIn(TOKEN[:9], row["prompt"], "a credential straddling the 600-char cut is masked first")
+        self.assertEqual((row["verdict"], row["kind"], row["program"]), ("correction", "failure", "curl"))
+
+    def test_failure_program_and_gating(self):
+        self.assertEqual(failure.program("Bash", {"command": "cd ~/x && git -C y status"}), "git")
+        self.assertEqual(failure.program("Bash", {"command": "FOO=1 python3 -c 'x'"}), "python3")
+        self.assertEqual(failure.program("mcp__x__y", {}), "mcp__x__y")
+        ev = {"tool_name": "Bash", "tool_input": {"command": "arc --help"}, "error": "exit 64", "session_id": "G"}
+        self.assertEqual(failure.job_for(ev)["kind"], "failure")
+        self.assertIsNone(failure.job_for(ev), "one judgement per program per session")
+        self.assertIsNotNone(failure.job_for(dict(ev, session_id="G2")))
+        self.assertIsNone(failure.job_for(dict(ev, session_id="G3", is_interrupt=True)))
+
+    def test_ast_lessons_shipped_check(self):
+        lines = [ln for ln, _ in ast_lessons.slice_into_redact(
+            "def a(x):\n    return x[:9]\n\ndef b(x):\n    return mask(a(x))\n")]
+        self.assertEqual(lines, [5])
+        for path in ("judge.py", "failure.py", "capture.py", "store.py", "reflex.py", "hindsight.py"):
+            with open(os.path.join(HOOKS, path)) as fh:
+                self.assertEqual(ast_lessons.check_source(fh.read()), [], f"the plugin passes its own check: {path}")
 
     def test_hindsight_record_is_a_pending_correction(self):
         row = judge.record({"kind": "hindsight", "session": "H", "reply": "x" * 700 + "THE END", "follow": "f"},
@@ -400,6 +428,38 @@ class EndToEnd(unittest.TestCase):
                   env).stdout
         self.assertIn("PREVIOUS reply was wrong", out)
         self.assertIn("not move your cursor", out)
+
+    def test_failure_flow(self):
+        stub = os.path.join(self.d.name, "mis")
+        with open(stub, "w") as fh:
+            fh.write(f"#!/bin/sh\ncat >/dev/null\ntouch {self.marker}\necho mistake\n")
+        os.chmod(stub, 0o755)
+        env = dict(self.env, LESSON_REFLEX_JUDGE=stub)
+        ev = {"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+              "tool_input": {"command": "arc-cdp --help", "description": "Read usage"},
+              "error": "Exit code 64 unknown command", "session_id": "F1"}
+        r = run(os.path.join(HOOKS, "failure.py"), ev, env)
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+        self.assertTrue(self.wait_for(os.path.join(self.home, "inbox", store.session_file("F1"))))
+        out = run(os.path.join(HOOKS, "reflex.py"), {"tool_name": "Read", "tool_input": {}, "session_id": "F1"},
+                  env).stdout
+        self.assertIn("YOUR mistake", out)
+        self.assertIn("arc-cdp --help", out)
+
+    def test_failures_can_be_turned_off(self):
+        ev = {"tool_name": "Bash", "tool_input": {"command": "x --bad"}, "error": "e", "session_id": "OFF"}
+        r = run(os.path.join(HOOKS, "failure.py"), ev, dict(self.env, LESSON_REFLEX_FAILURES="0"))
+        self.assertEqual(r.returncode, 0)
+        time.sleep(0.5)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "failures-seen.jsonl")), "nothing judged or recorded")
+
+    def test_ast_reflex_warns_before_the_edit(self):
+        target = os.path.join(self.d.name, "tool.py")
+        ev = {"tool_name": "Write", "session_id": "A1",
+              "tool_input": {"file_path": target, "content": "def f(s):\n    return redact(s[:9])\n"}}
+        out = run(os.path.join(HOOKS, "ast_reflex.py"), ev, self.env).stdout
+        self.assertIn("slice-into-redact", out)
+        self.assertFalse(os.path.exists(target), "a lesson, not a gate: nothing is written by the hook")
 
     def test_judge_does_not_judge_itself(self):
         self.capture("no", env=dict(self.env, LESSON_REFLEX_JUDGING="1"))

@@ -126,6 +126,33 @@ def carries_secret(text):
     return False
 
 
+def mask(text):
+    """PURE: TEXT with every credential-shaped token (the shapes carries_secret knows) replaced by <secret>. Callers
+    mask the WHOLE text and only then cut it -- cutting first can split a token below the length that is recognised."""
+    text = text or ""
+    out, i = [], 0
+    while i < len(text):
+        hit = 0
+        if i == 0 or text[i - 1] not in KEY:
+            for prefix, allowed, minimum, exact in SECRET_SHAPES:
+                if text.startswith(prefix, i):
+                    tail = 0
+                    while i + len(prefix) + tail < len(text) and text[i + len(prefix) + tail] in allowed:
+                        tail += 1
+                    body = text[i + len(prefix):i + len(prefix) + tail]
+                    ok = tail == exact if exact else tail >= minimum
+                    if ok and any(ch.isdigit() for ch in body):
+                        hit = len(prefix) + tail
+                        break
+        if hit:
+            out.append("<secret>")
+            i += hit
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 def validate(row, existing):
     """PURE: '' if ROW may be added as a lesson, else why not. ROW's needle is already stripped."""
     if row.get("tool") not in TOOLS:

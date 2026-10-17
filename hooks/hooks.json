@@ -1,5 +1,5 @@
 {
-  "description": "lesson-reflex: correction capture (UserPromptSubmit), hindsight (Stop), lessons fired at the action (PreToolUse)",
+  "description": "lesson-reflex: correction capture (UserPromptSubmit), hindsight (Stop), tool-failure capture (PostToolUseFailure), structural lessons and lessons fired at the action (PreToolUse)",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -22,6 +22,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/ast_reflex.py\"",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "Stop": [
@@ -30,6 +40,17 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/hindsight.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/failure.py\"",
             "timeout": 5
           }
         ]

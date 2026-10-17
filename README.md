@@ -8,7 +8,15 @@ the action where the mistake started (a command, a function name, a flag), and w
 whenever Claude is about to run a Bash command or write Edit/Write text containing that text, the lesson is shown
 to it, once per session (a subagent counts separately).
 
-It also catches mistakes nobody pointed out. At the end of each turn, the judge looks back at Claude's previous reply
+It also catches mistakes nobody pointed out, in three ways:
+
+- **Tool failures.** When a tool call fails, the judge decides whether it was Claude's own mistake (a wrong flag,
+  path, interpreter or pattern) rather than a check doing its job or the environment. A mistake is announced at the
+  next tool call. At most one judgement per program per session.
+- **Structural lessons.** Before an Edit or Write to a Python file lands, the file as it would be after the edit is
+  parsed and checked for known mistake *shapes* that live in data flow, where no text match can see them (see
+  `hooks/ast_lessons.py`). It warns; it never blocks.
+- **Hindsight.** At the end of each turn, the judge looks back at Claude's previous reply
 and what followed it: your next message, then the tools Claude ran and what it said. If that shows the reply was
 wrong, Claude is told at its next tool call, the same way as a correction. Hindsight works where foresight does not:
 asked *before* the fact whether a reply was about to be wrong, the same kind of judge did worse than chance.
@@ -90,6 +98,14 @@ The verdict takes several seconds (about 3 to 6 in the author's runs). It is ann
 may be later in the same turn or in the next one; subagents are never told. A correction that is never announced
 still shows up in `lesson pending`.
 
+**Tool failure** (PostToolUseFailure): the failed action, its description and the error (credential-shaped tokens
+masked first, then cut to 4000, 300 and 2000 characters) go to the judge, which answers `mistake`, `expected` or
+`environment`. A call interrupted by the user is skipped; that is a correction, which the correction capture reads.
+Measured on 40 of the author's real failed Bash calls, hand-labelled before any model saw them (6 were mistakes):
+the default sonnet judge caught all 6, and also called 11 of the 34 benign failures mistakes. (That sample kept only
+each call's description and a cut error, not the command itself.) Expect most real mistakes to be caught and some
+noise; each false alarm costs one `lesson dismiss`. Set `LESSON_REFLEX_FAILURES=0` to turn the failure capture off.
+
 **Hindsight** (Stop): at the end of each turn, the reply that ended the *previous* turn (up to 1500 characters) and what
 followed it (your message, then this turn's tool calls and reply, up to 1500 characters) go to the judge, which
 answers `error`, `fine` or `unclear`. An `error` is announced at Claude's next tool call and listed by `lesson pending`
@@ -98,9 +114,12 @@ like a correction. The hindsight hook never blocks the end of a turn.
 Each judge call is a small model request. To change the judge:
 
 - `LESSON_REFLEX_MODEL=haiku`: cheaper, noisier.
+- `LESSON_REFLEX_FAILURES=0`: no tool-failure judgements.
 - `LESSON_REFLEX_JUDGE="your-command"`: any program that reads the job as JSON on stdin and prints one word. A
   correction job is `{"session","prompt","previous","cwd"}` and wants `correction`, `request` or `other`; a hindsight
-  job is `{"kind":"hindsight","session","reply","follow","cwd"}` and wants `error`, `fine` or `unclear`. Only the leading word of its output is read. A relative path
+  job is `{"kind":"hindsight","session","reply","follow","cwd"}` and wants `error`, `fine` or `unclear`; a failure
+  job is `{"kind":"failure","session","tool","program","action","description","error","cwd"}` and wants `mistake`,
+  `expected` or `environment`. Only the leading word of its output is read. A relative path
   such as `./judge` is resolved against the session's working directory when the prompt was sent; quote a path
   containing spaces.
 
@@ -131,13 +150,24 @@ private (0700) and its files 0600. Delete the directory to start over.
 | file | what it holds |
 |---|---|
 | `lessons.jsonl` | your lessons |
-| `corrections.jsonl` | one row per judgement (id, session id, kind, verdict, time). Text is kept **only** for a correction (your prompt's first 600 characters) or a hindsight error (the last 600 characters of the reply that was wrong). |
+| `corrections.jsonl` | one row per judgement (id, session id, kind, verdict, time). Text is kept **only** for a correction (your prompt's first 600 characters), a hindsight error (the last 600 characters of the reply that was wrong) or a tool-failure mistake (the action's first 600 characters), with credential-shaped tokens masked before it is cut. |
+| `failures-seen.jsonl` | one row per program per session already sent to the failure judge (a hash of the session id and the program name) |
+| `ast-fired.json` | which structural findings each recent session has already been shown |
 | `dismissed.txt` | ids of corrections you dismissed |
 | `inbox/` | corrections waiting to be announced; each is removed once announced or closed. A session that ends before its next tool call leaves its file behind; `lesson pending` still lists the correction. |
 | `fired.json` | which lessons have already fired, for the 256 most recent entries (a session's main thread and each subagent are separate entries) |
 | `*.lock` | lock files that keep concurrent sessions and judges from overwriting each other |
 
 `corrections.jsonl` grows by one row per judgement (up to two per turn), and nothing trims it.
+
+## Structural lessons
+
+`hooks/ast_lessons.py` ships one check, `slice-into-redact`: text cut (`x[:N]`) before it reaches a masking function
+(`redact`, `mask`, `scrub`, `sanitize`, `anonymize`, `mask_secrets`), so a credential straddling the cut becomes a
+fragment too short to recognise and is stored or sent. It follows the value through local names, lists it is
+appended to, tuple unpacking, and functions that return cut text, within one file. That bug recurred five times
+while this plugin was being built, which is why it is the first. To add a check, write a function from source text to
+`[(line, message)]` and add it to `CHECKS`. Run it directly with `python3 hooks/ast_lessons.py check FILE...`.
 
 ## Prior art
 

@@ -24,6 +24,7 @@ import store  # noqa: E402
 
 VERDICTS = ("correction", "request", "other")
 HINDSIGHT_VERDICTS = ("error", "fine", "unclear")
+FAILURE_VERDICTS = ("mistake", "expected", "environment")
 MODEL = os.environ.get("LESSON_REFLEX_MODEL", "sonnet")
 MAX_JUDGES = 3
 TIMEOUT = 60
@@ -63,6 +64,28 @@ A user simply asking for more, or changing topic, is not an error. Reply with ex
 </FOLLOW_UP>"""
 
 
+FAILURE_PROMPT = """You label one failed tool call. An assistant ran ACTION ({tool}); it failed with ERROR.
+
+mistake     = the assistant's own wrong usage, flag, path, interpreter, pattern or broken script -- a lesson would
+              stop it repeating
+expected    = a test, check, gate or search doing its job (a deliberately failing test, a search that found nothing)
+environment = something outside the assistant's control: a missing resource, the network, a timeout
+
+Reply with exactly one word: mistake, expected or environment.
+
+<DESCRIPTION>
+{description}
+</DESCRIPTION>
+
+<ACTION>
+{action}
+</ACTION>
+
+<ERROR>
+{error}
+</ERROR>"""
+
+
 def parse(out, verdicts=VERDICTS):
     """PURE: the verdict, read from the FIRST word of the output only (markdown and punctuation trimmed), or ''.
 
@@ -98,13 +121,18 @@ def run_judge(job, run=subprocess.run, base=None):
     The error never quotes the judge's output: a judge that echoes the prompt would otherwise store it."""
     env = dict(os.environ, LESSON_REFLEX_JUDGING="1", CLAUDE_CODE_DISABLE_AUTO_MEMORY="1")
     custom = os.environ.get("LESSON_REFLEX_JUDGE")
-    hindsight = job.get("kind") == "hindsight"
+    kind = job.get("kind", "correction")
     try:
         argv = custom_argv(custom, base or os.getcwd()) if custom else judge_argv()
         if custom:
             stdin = json.dumps(job)
-        elif hindsight:
+        elif kind == "hindsight":
             stdin = HINDSIGHT_PROMPT.format(reply=job["reply"], follow=job["follow"])
+        elif kind == "failure":
+            stdin = FAILURE_PROMPT.format(tool=job.get("tool", ""),
+                                          description=store.mask(str(job.get("description", "")))[:300],
+                                          action=store.mask(str(job["action"]))[-4000:],
+                                          error=store.mask(str(job["error"]))[:2000])
         else:
             stdin = PROMPT.format(previous=job["previous"], prompt=job["prompt"])
         with tempfile.TemporaryDirectory() as cwd:
@@ -120,7 +148,8 @@ def run_judge(job, run=subprocess.run, base=None):
         return "", f"judge failed: {type(e).__name__}"
     if r.returncode != 0:
         return "", f"judge exited {r.returncode}"
-    verdict = parse(r.stdout, HINDSIGHT_VERDICTS if hindsight else VERDICTS)
+    verdicts = {"hindsight": HINDSIGHT_VERDICTS, "failure": FAILURE_VERDICTS}.get(kind, VERDICTS)
+    verdict = parse(r.stdout, verdicts)
     return (verdict, "") if verdict else ("", f"judge answered off-format ({len(r.stdout or '')} characters)")
 
 
@@ -129,15 +158,22 @@ def record(job, verdict, error=""):
     is recorded as a correction of kind hindsight, keeping the end of the reply that was wrong, so the inbox,
     `lesson pending` and `lesson dismiss` work the same for both."""
     kind = job.get("kind", "correction")
-    if kind == "hindsight" and verdict == "error":
+    if (kind, verdict) in (("hindsight", "error"), ("failure", "mistake")):
         verdict = "correction"
     row = {"id": store.new_id(), "session": job.get("session", ""), "kind": kind, "verdict": verdict or "error",
            "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     if error:
         row["error"] = error
     if verdict == "correction":
-        text = job.get("reply", "")[-600:] if kind == "hindsight" else job.get("prompt", "")[:600]
-        row["prompt"] = str(text)
+        if kind == "hindsight":
+            text = store.mask(str(job.get("reply", "")))[-600:]
+        elif kind == "failure":
+            text = store.mask(str(job.get("action", "")))[:600]
+        else:
+            text = store.mask(str(job.get("prompt", "")))[:600]
+        row["prompt"] = text
+        if kind == "failure":
+            row["program"] = str(job.get("program", ""))[:80]
     store.append_jsonl(store.path("corrections.jsonl"), row)
     if verdict == "correction":
         store.add_to_inbox(row["session"], row["id"])
@@ -164,7 +200,7 @@ def main():
         return 0
     if not isinstance(job, dict):
         return 0
-    needs = ("reply", "follow") if job.get("kind") == "hindsight" else ("prompt", "previous")
+    needs = {"hindsight": ("reply", "follow"), "failure": ("action", "error")}.get(job.get("kind"), ("prompt", "previous"))
     if any(k not in job for k in needs):
         return 0
     try:
