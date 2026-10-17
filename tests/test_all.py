@@ -197,7 +197,24 @@ class Pure(unittest.TestCase):
         for pre in escapes:
             self.assertNotIn(TOKEN, store.mask("X" + pre + TOKEN), pre)
             self.assertTrue(store.carries_secret("X" + pre + TOKEN), pre)
-        self.assertFalse(store.carries_secret("xn" + TOKEN), "a key character before the prefix is not a boundary")
+        self.assertFalse(store.carries_secret("brisk-" + "walk2024morning"), "sk- without a key's shape is a word")
+        self.assertFalse(store.carries_secret("sk-" + "abcdefghij" * 4 + "2"), "one case only is not a key's shape")
+        # ANY encoding in front, not a list of them (the fourth audit: %20, %3D, ANSI colour codes, \\cJ, &#32):
+        # a distinctive prefix is a key wherever it starts
+        keys = [TOKEN, "sk-ant-" + "api03-" + "Ab1" * 10, "AI" + "za" + "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q",
+                "xo" + "xb-" + "1234567890-abcdefGHIJ", "AK" + "IA" + "Q3EGR7WZ5LXHJ2PN"]
+        fronts = ["%20", "%3D", "%0A", "key%3D", "\x1b[0m", "\033[31m", "\x1b[01;31m\x1b[K", "\\e[1m", "\\cJ", "\\x1b[0m", "\\033[31m",
+                  "&#32", "^M", "\x41", "\u00201", "0", "9", "Z"]
+        for k in keys:
+            for f in fronts:
+                self.assertNotIn(k[:12], store.mask("x" + f + k), (f, k[:6]))
+                self.assertTrue(store.carries_secret("x" + f + k), (f, k[:6]))
+        legacy = "sk-" + "Ab1" * 12
+        for f in ("%20", "\x1b[0m", "0", "Z", "_"):
+            self.assertNotIn(legacy[:12], store.mask("x" + f + legacy), f)
+        for word in ("risk-", "task-", "desk-"):  # a word ending in -sk- is not a key
+            self.assertEqual(store.mask("the " + word + "assessment-2024-v2-final-approved-x"),
+                             "the " + word + "assessment-2024-v2-final-approved-x")
         aws = "AK" + "IA" + "Q3EGR7WZ5LXHJ2PN"  # first letters look like hex digits
         for w, width in (("x", 2), ("u", 4), ("U", 8)):
             for d in range(width):  # after the letter alone and after every partial hex run

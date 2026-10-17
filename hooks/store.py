@@ -110,63 +110,69 @@ def locked(name="state.lock"):
         os.close(fd)
 
 
-HEX = frozenset("0123456789abcdefABCDEF")
+ALNUM = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+GENERIC = {"sk-": 32}  # prefix ordinary words end in -> the run of letters and digits a real key has after it
+MAX_KEY = 512  # no key is longer; a longer run is masked up to here and the rest left as text
 
 
-ESCAPE_WIDTH = {"x": 2, "u": 4, "U": 8}
+def _runs(text, allowed):
+    """PURE: run[i] = how many characters from i on are in ALLOWED -- one pass from the end, so every lookup is O(1)."""
+    run = [0] * (len(text) + 1)
+    for i in range(len(text) - 1, -1, -1):
+        run[i] = run[i + 1] + 1 if text[i] in allowed else 0
+    return run
 
 
-def escape_end(text, j):
-    """PURE: where the escape whose letter is at TEXT[j] (just after a backslash) ends: \\x + 2 hex digits, \\u + 4,
-    \\U + 8, octal up to 3 digits, else one key character. Punctuation (`\\"`) is no escape letter: returns j."""
-    if j >= len(text):
-        return j
-    if text[j] in ESCAPE_WIDTH:
-        k = j + 1
-        while k < len(text) and k <= j + ESCAPE_WIDTH[text[j]] and text[k] in HEX:
-            k += 1
-        return k
-    if text[j] in "01234567":
-        k = j
-        while k < len(text) and k < j + 3 and text[k] in "01234567":
-            k += 1
-        return k
-    return j + 1 if text[j] in KEY else j
+def _next(text, pred):
+    """PURE: nxt[i] = the first index >= i whose character satisfies PRED (len(text) if none)."""
+    nxt = [len(text)] * (len(text) + 1)
+    for i in range(len(text) - 1, -1, -1):
+        nxt[i] = i if pred(text[i]) else nxt[i + 1]
+    return nxt
 
 
-def at_boundary(text, i):
-    """PURE: can a token start at TEXT[i]? At the start, after a non-key character, or right where ANY backslash
-    escape written out as text ends -- `\\n`, `\\a`, `\\033`, `\\x1b`, `\\u00e9`, `\\U0001F600`, `\\_` -- whose last
-    character would otherwise read as part of the key. Three audit rounds found these one family at a time; the tests
-    now sweep every escape a backslash can start."""
-    if i == 0 or text[i - 1] not in KEY:
-        return True
-    for k in range(i - 1, max(-1, i - 11), -1):
-        # any reading of the escape: its letter alone, any part of its digit run, or all of it -- a key's first
-        # letters can look like hex digits (`\\xAKIA...`, `\\u00AKIA...` must not lose their A)
-        if text[k] == "\\" and k + 2 <= i <= escape_end(text, k + 1):
-            return True
-    return False
+def key_spans(text):
+    """PURE: (start, end) of every credential-shaped token in TEXT, merged, in order -- found by SHAPE ALONE, whatever
+    comes before it. A known prefix followed by enough key characters with a digit among them is a key; the generic
+    `sk-` (ordinary words end in it: risk-, task-) must also be followed by 32+ letters and digits mixing upper case,
+    lower case and digits, the shape of a real key and never of a word.
+
+    WHY no boundary: requiring one ("the character before is not a key character") was beaten four audit rounds
+    running by one more encoding in front of the key -- \\n, then \\a and \\033, then \\xAKIA, then %20, ANSI
+    colour codes, ^M, &#32. A list of encodings never ends; a shape does not need one. Linear in TEXT."""
+    text = text or ""
+    if not text:
+        return []
+    runs = {}
+    digit, upper, lower = _next(text, str.isdigit), _next(text, str.isupper), _next(text, str.islower)
+    spans = []
+    for prefix, allowed, minimum, exact in SECRET_SHAPES:
+        if prefix in GENERIC:
+            allowed = ALNUM
+        run = runs.setdefault(id(allowed), _runs(text, allowed))
+        start = text.find(prefix)
+        while start >= 0:
+            p = start + len(prefix)
+            n = min(run[p], MAX_KEY)
+            ok = n == exact if exact else n >= minimum
+            ok = ok and digit[p] < p + n
+            if ok and prefix in GENERIC:
+                ok = n >= GENERIC[prefix] and upper[p] < p + n and lower[p] < p + n
+            if ok:
+                spans.append((start, p + n))
+            start = text.find(prefix, start + 1)
+    merged: list = []
+    for a, b in sorted(spans):
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
 
 
 def carries_secret(text):
-    """PURE: does TEXT contain a token that starts with a known credential prefix and continues with enough key
-    characters to be a real key?"""
-    text = text or ""
-    for prefix, allowed, minimum, exact in SECRET_SHAPES:
-        start = text.find(prefix)
-        while start >= 0:
-            boundary = at_boundary(text, start)
-            tail = ""
-            for ch in text[start + len(prefix):]:
-                if ch not in allowed:
-                    break
-                tail += ch
-            long_enough = len(tail) == exact if exact else len(tail) >= minimum
-            if boundary and long_enough and any(ch.isdigit() for ch in tail):
-                return True
-            start = text.find(prefix, start + 1)
-    return False
+    """PURE: does TEXT contain a credential-shaped token (see key_spans)?"""
+    return bool(key_spans(text))
 
 
 def mask_values(obj):
@@ -192,29 +198,15 @@ def mask(text):
 
 
 def mask_once(text):
-    """PURE: TEXT with every credential-shaped token (the shapes carries_secret knows) replaced by <secret>. Callers
-    mask the WHOLE text and only then cut it -- cutting first can split a token below the length that is recognised."""
+    """PURE: TEXT with every credential-shaped token (key_spans) replaced by <secret>. Callers mask the WHOLE text and
+    only then cut it -- cutting first can split a token below the length that is recognised."""
     text = text or ""
     out, i = [], 0
-    while i < len(text):
-        hit = 0
-        if at_boundary(text, i):
-            for prefix, allowed, minimum, exact in SECRET_SHAPES:
-                if text.startswith(prefix, i):
-                    tail = 0
-                    while i + len(prefix) + tail < len(text) and text[i + len(prefix) + tail] in allowed:
-                        tail += 1
-                    body = text[i + len(prefix):i + len(prefix) + tail]
-                    ok = tail == exact if exact else tail >= minimum
-                    if ok and any(ch.isdigit() for ch in body):
-                        hit = len(prefix) + tail
-                        break
-        if hit:
-            out.append("<secret>")
-            i += hit
-        else:
-            out.append(text[i])
-            i += 1
+    for a, b in key_spans(text):
+        out.append(text[i:a])
+        out.append("<secret>")
+        i = b
+    out.append(text[i:])
     return "".join(out)
 
 

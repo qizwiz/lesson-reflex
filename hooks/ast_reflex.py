@@ -90,7 +90,7 @@ def handle(ev, check=None, state_path=None, read=_read):
     path = str(ti.get("file_path"))
     msgs = []
     # read-modify-write under the store's lock, written 0600 through write_atomic: concurrent sessions keep each
-    # other's entries, and the file (paths and source lines) is as private as the rest of the store
+    # other's entries; the file holds only hashes, and is as private as the rest of the store
     with store.locked("ast.lock"):
         try:
             with open(state_path) as fh:
