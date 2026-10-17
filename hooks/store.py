@@ -11,6 +11,7 @@ Everything lives under $LESSON_REFLEX_HOME (default ~/.claude/lesson-reflex), cr
   hindsight-seen.jsonl replies already sent to the hindsight judge
   ast-fired.json     {session: [structural findings already shown]}, written under ast.lock
 """
+import bisect
 import contextlib
 import fcntl
 import hashlib
@@ -35,8 +36,9 @@ SECRET_SHAPES = (
     ("AKIA", UPPER_DIGITS, 16, 0), ("ASIA", UPPER_DIGITS, 16, 0),  # AWS access key ids (16 or more)
     ("xoxb-", KEY, 10, 0), ("xoxa-", KEY, 10, 0), ("xoxp-", KEY, 10, 0), ("xoxr-", KEY, 10, 0),  # Slack
     ("xoxs-", KEY, 10, 0), ("xapp-", KEY, 10, 0),
-    ("sk-proj-", ALNUM, 32, 0), ("sk-svcacct-", ALNUM, 32, 0), ("sk-admin-", ALNUM, 32, 0),  # OpenAI
-    ("sk-None-", ALNUM, 32, 0), ("sk-", ALNUM, 32, 0),
+    ("sk-proj-", KEY, 32, 0), ("sk-svcacct-", KEY, 32, 0), ("sk-admin-", KEY, 32, 0),  # OpenAI: _ and - in body
+    ("sk-None-", KEY, 32, 0), ("sk-or-v1-", ALNUM, 64, 0), ("sk-", ALNUM, 32, 0),  # OpenRouter; generic sk-
+    ("sk-", KEY, 22, 22),  # LiteLLM virtual keys: sk- + token_urlsafe(16), exactly 22, digit AND mixed case
     ("sk_test_", ALNUM, 20, 0), ("rk_test_", ALNUM, 20, 0),  # Stripe test
     ("glpat-", KEY, 20, 0), ("shpat_", ALNUM, 32, 0), ("AIza", KEY, 35, 0), ("sk-ant-", KEY, 24, 0),  # GitLab etc.
     ("gsk_", ALNUM, 40, 0), ("sk_live_", ALNUM, 20, 0), ("rk_live_", ALNUM, 20, 0), ("hf_", ALNUM, 30, 0),
@@ -115,8 +117,10 @@ def locked(name="state.lock"):
         os.close(fd)
 
 
-GENERIC = {"sk-": 32}  # prefix ordinary words end in -> the run of letters and digits a real key has after it
-MAX_KEY = 512  # no key is longer; a longer run is masked up to here and the rest left as text
+# prefixes ordinary words END in (risk-, disk_test_, task_live_, work_live_) -> the minimum run after it; these need
+# a DIGIT in the body (mixed case is not enough: disk_test_UsesTheTemporaryDirectory is a name). A real key of these
+# families has no digit about 1.5% of the time (24 random letters and digits), a name almost always.
+GENERIC = {"sk-": 32, "sk_test_": 20, "sk_live_": 20, "rk_test_": 20, "rk_live_": 20}
 
 
 def _runs(text, allowed):
@@ -137,9 +141,11 @@ def _next(text, pred):
 
 def key_spans(text):
     """PURE: (start, end) of every credential-shaped token in TEXT, merged, in order -- found by SHAPE ALONE, whatever
-    comes before it. A known prefix followed by enough key characters with a digit among them is a key; the generic
-    `sk-` (ordinary words end in it: risk-, task-) must also be followed by 32+ letters and digits mixing upper case,
-    lower case and digits, the shape of a real key and never of a word.
+    comes before it. A known prefix followed by enough key characters, with a digit or mixed case among them, is a
+    key; the generic `sk-` (ordinary words end in it: risk-, task-) needs 32+ letters and digits after it, one of them
+    a digit (a DeepSeek-style key is lowercase hex; a CamelCase name has no digit), or -- a LiteLLM key -- exactly 22
+    letters, digits, _ and - with a digit and mixed case. An AWS id is exactly 16 after
+    the prefix, or a longer run whose first 16 hold a digit.
 
     WHY no boundary: requiring one ("the character before is not a key character") was beaten four audit rounds
     running by one more encoding in front of the key -- \\n, then \\a and \\033, then \\xAKIA, then %20, ANSI
@@ -149,23 +155,53 @@ def key_spans(text):
         return []
     runs = {}
     digit, upper, lower = _next(text, str.isdigit), _next(text, str.isupper), _next(text, str.islower)
-    spans = []
-    for prefix, allowed, minimum, exact in SECRET_SHAPES:
-        run = runs.setdefault(id(allowed), _runs(text, allowed))
-        start = text.find(prefix)
+    spans: list = []
+
+    def judge(prefix, allowed, minimum, exact, start, end):
+        """The span of the key at START if the run from its body to END (or the end of the run) has the row's shape."""
+        p = start + len(prefix)
+        if id(allowed) not in runs:  # built once per alphabet (setdefault would build it on every call)
+            runs[id(allowed)] = _runs(text, allowed)
+        n = min(runs[id(allowed)][p], end - p)
+        varied = digit[p] < p + n or (upper[p] < p + n and lower[p] < p + n)
+        if allowed is UPPER_DIGITS:  # AWS: exactly 16, or a longer run whose first 16 hold a digit
+            ok = n == minimum or (n > minimum and digit[p] < p + minimum)  # a word like ASIA+PACIFIC... is not a key
+        else:  # a digit, or mixed case, in the body (a digit-free key is rare, not impossible)
+            ok = (n == exact if exact else n >= minimum) and varied
+        if ok and prefix in GENERIC:  # a word-ending prefix: a digit (and, for an exact shape, mixed case)
+            ok = (digit[p] < p + n and upper[p] < p + n and lower[p] < p + n) if exact else (
+                n >= GENERIC[prefix] and digit[p] < p + n)
+        return (start, p + n) if ok else None
+
+    # rows that only need a minimum length are judged on the whole run
+    for row in SECRET_SHAPES:
+        if row[1] is UPPER_DIGITS or row[3]:
+            continue
+        start = text.find(row[0])
         while start >= 0:
-            p = start + len(prefix)
-            n = min(run[p], MAX_KEY)
-            if allowed is UPPER_DIGITS:  # AWS: exactly 16, or a longer run whose first 16 hold a digit
-                ok = n == minimum or (n > minimum and digit[p] < p + minimum)  # not ASIAPACIFICREGIONSOUTH2
-            else:  # a digit, or mixed case, in the body (a digit-free key is rare, not impossible)
-                ok = (n == exact if exact else n >= minimum) and (
-                    digit[p] < p + n or (upper[p] < p + n and lower[p] < p + n))
-            if ok and prefix in GENERIC:
-                ok = n >= GENERIC[prefix] and upper[p] < p + n and lower[p] < p + n
-            if ok:
-                spans.append((start, p + n))
-            start = text.find(prefix, start + 1)
+            span = judge(*row, start, len(text))
+            if span:
+                spans.append(span)
+            start = text.find(row[0], start + 1)
+    # rows that need an EXACT length (AWS, LiteLLM) are judged right to left, each run cut where the nearest key found
+    # to its right starts -- of any family, these included -- which is what a second pass over the masked text would
+    # see (the seventh and eighth audits: a digit-free AKIA id or a LiteLLM key glued to another key read as one long
+    # run and was missed). One pass, linear but for the sorted insert.
+    starts = sorted(a for a, _b in spans)
+    candidates = []
+    for row in SECRET_SHAPES:
+        if row[1] is UPPER_DIGITS or row[3]:
+            start = text.find(row[0])
+            while start >= 0:
+                candidates.append((start, row))
+                start = text.find(row[0], start + 1)
+    for start, row in sorted(candidates, key=lambda c: -c[0]):
+        p = start + len(row[0])
+        k = bisect.bisect_left(starts, p)
+        span = judge(*row, start, starts[k] if k < len(starts) else len(text))
+        if span:
+            spans.append(span)
+            bisect.insort(starts, start)
     merged: list = []
     for a, b in sorted(spans):
         if merged and a <= merged[-1][1]:
@@ -194,12 +230,12 @@ def mask_values(obj):
 
 
 def mask(text):
-    """PURE: mask_once until nothing changes -- a cheap guard: key_spans finds every key in one pass, so a second pass
-    should find nothing, and this loop makes sure of it."""
-    prev, out = None, text or ""
-    while out != prev:
-        prev, out = out, mask_once(out)
-    return out
+    """PURE: TEXT with every key key_spans finds replaced by <secret> -- ONE pass. Repeating until nothing changed
+    peeled a run of digit-free AKIA blocks one block per pass (the sixth audit: 4 KB took 3.6 s). key_spans settles in
+    one pass instead: it judges the exact-length shapes (AWS, LiteLLM) right to left, each run cut where the nearest
+    key found to its right starts -- of any family, those included -- which is what a second pass over the masked
+    text would have seen. The tests assert that masked text carries no key, glued pairs included."""
+    return mask_once(text)
 
 
 def mask_once(text):

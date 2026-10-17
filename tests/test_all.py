@@ -26,6 +26,12 @@ import store  # noqa: E402
 TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # shaped like a key, not one
 
 
+def _timed(fn):
+    start = time.time()
+    fn()
+    return time.time() - start
+
+
 def run(script, ev, env):
     return subprocess.run([sys.executable, script], input=json.dumps(ev), capture_output=True, text=True,
                           env=env, timeout=30, check=False)
@@ -60,7 +66,7 @@ class Pure(unittest.TestCase):
         for text in ("sk-learn is a library", "AKIAisnotakey", "use ghp_ tokens, never paste one",
                      "pin flask-sqlalchemy-utils to 0.41", "use disk-usage-reporter-cli instead of du",
                      "set ASIA_PACIFIC_REGION_ENDPOINT before deploy", "sk-learn-compatible-estimator-pipelines",
-                     "sk-rate-limiter-middleware-for-express", "ASIAPACIFICREGIONSOUTH2"):
+                     "sk-rate-limiter-middleware-for-express", "ASIA" + "PACIFICREGIONSOUTH2"):
             self.assertFalse(store.carries_secret(text), text)
         ok = {"tool": "Bash", "needle": "git push", "lesson": "x" * 25}
         for field in ("needle", "lesson", "source"):
@@ -198,7 +204,6 @@ class Pure(unittest.TestCase):
             self.assertNotIn(TOKEN, store.mask("X" + pre + TOKEN), pre)
             self.assertTrue(store.carries_secret("X" + pre + TOKEN), pre)
         self.assertFalse(store.carries_secret("brisk-" + "walk2024morning"), "sk- without a key's shape is a word")
-        self.assertFalse(store.carries_secret("sk-" + "abcdefghij" * 4 + "2"), "one case only is not a key's shape")
         # ANY encoding in front, not a list of them (the fourth audit: %20, %3D, ANSI colour codes, \\cJ, &#32):
         # a distinctive prefix is a key wherever it starts
         keys = [TOKEN, "sk-ant-" + "api03-" + "Ab1" * 10, "AI" + "za" + "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q",
@@ -212,13 +217,42 @@ class Pure(unittest.TestCase):
         # every family, glued, and a body with no digit (the fifth audit: sk-svcacct-, sk-admin-, sk-None- were lost
         # when the generic sk- stopped at the hyphen; QA in-house: sk_test_ dropped, digit-free keys passed)
         for prefix, allowed, _minimum, _exact in store.SECRET_SHAPES:
-            body = "Q3EGR7WZ5LXHJ2PN" if allowed is store.UPPER_DIGITS else "AbcDef" * 7
+            # long enough for every minimum (OpenRouter's is 64); digit-free except the generic sk-, which needs one
+            body = ("Q3EGR7WZ5LXHJ2PN" if allowed is store.UPPER_DIGITS
+                    else "abcde1" * 12 if prefix in store.GENERIC else "AbcDef" * 12)
             self.assertTrue(store.carries_secret("x" + prefix + body), prefix)
             self.assertNotIn(prefix + body[:8], store.mask("%20" + prefix + body), prefix)
         self.assertTrue(store.carries_secret("x" + "AK" + "IA" + "IOSFODNN7EXAMPLE2"), "an AWS id with a longer run")
         for word in ("num_highs_in_window_last_30_days", "def test_task_test_fixture_2024_case():",
                      "network_live_stream_v2_status", "mask_test_value_1234567890"):
             self.assertFalse(store.carries_secret(word), word)
+        # REAL formats, not shapes I designed (the sixth audit: sk-proj-/sk-svcacct-/sk-admin- bodies carry _ and -
+        # around T3BlbkFJ, DeepSeek keys are lowercase hex, OpenRouter's are sk-or-v1- + 64 hex)
+        r = "Ab1_cD-eF2"
+        realistic = ["sk-proj-" + r * 7 + "T3BlbkFJ" + r * 7, "sk-svcacct-" + r * 6 + "T3BlbkFJ" + r * 6,
+                     "sk-admin-" + r * 6 + "T3BlbkFJ" + r * 6,
+                     "sk-" + "Ab1Cd2Ef3Gh4Ij5Kl6Mn" + "T3BlbkFJ" + "Op7Qr8St9Uv0Wx1Yz2Ab",
+                     "sk-" + "0123456789abcdef" * 2, "sk-or-v1-" + "0123456789abcdef" * 4]
+        for k in realistic:
+            for front in ("", "x", "%20", "key="):
+                out = store.mask(front + k + " end")
+                self.assertTrue(store.carries_secret(front + k), (front, k[:10]))
+                self.assertNotIn(k[len(k) // 2:len(k) // 2 + 12], out, (front, k[:10]))
+        for name in ("task-RunTheMigrationStepForQuarterlyReports", "def disk_test_UsesTheTemporaryDirectory():"):
+            self.assertEqual(store.mask(name), name)  # CamelCase after a prefix, no digit: a name
+        self.assertLess(_timed(lambda: store.mask("AK" + "IA" * 2000)), 1.0)  # one pass, never peeled per block
+        # the seventh audit: a digit-free AWS id glued to another key, and LiteLLM's sk- + 22 URL-safe characters
+        aiza = "AI" + "za" + "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q"
+        glued = "aws --key " + "AK" + "IAABCDEFGHIJKLMNOP" + aiza
+        self.assertFalse(store.carries_secret(store.mask(glued)), "masked text must not still carry a key")
+        ghp = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        for two in ("AK" + "IAABCDEFGHIJKLMNOP" + "AK" + "IAIOSFODNN7EXAMPL2",  # eighth audit: exact rows cut each other
+                    "sk-" + "xY3_kP9-qR2mN7vB4cT1wZ" + ghp, ("sk-" + "xY3_kP9-qR2mN7vB4cT1wZ") * 2):
+            self.assertFalse(store.carries_secret(store.mask(two)), two[:12])
+        self.assertLess(_timed(lambda: store.mask(("sk-" + "xY3_kP9-qR2mN7vB4cT1wZ") * 3000)), 2.0)
+        litellm = "sk-" + "xY3_kP9-qR2mN7vB4cT1wZ"
+        self.assertNotIn(litellm[3:], store.mask("x " + litellm + " y"))
+        self.assertEqual(store.mask("risk-assessment-2024-q3-report"), "risk-assessment-2024-q3-report")
         legacy = "sk-" + "Ab1" * 12
         for f in ("%20", "\x1b[0m", "0", "Z", "_"):
             self.assertNotIn(legacy[:12], store.mask("x" + f + legacy), f)
