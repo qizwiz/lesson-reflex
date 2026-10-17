@@ -11,7 +11,7 @@ saved), run from a fresh empty directory. The texts go to it on stdin, never on 
 user could read them with `ps`.
 Replace it with any command: set LESSON_REFLEX_JUDGE to a program that reads the same JSON on stdin and prints one
 of the words for its kind (see README); it gets the texts unmasked and uncut.
-At most MAX_JUDGES run at once; a prompt that finds every slot busy is recorded as verdict "busy", not judged.
+At most MAX_JUDGES run at once; a job that finds every slot busy is recorded as verdict "busy", not judged.
 """
 import fcntl
 import json

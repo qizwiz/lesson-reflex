@@ -190,6 +190,12 @@ class Pure(unittest.TestCase):
         self.assertIn("Bash:pop-to-buffer", fired)
         self.assertNotIn("Bash:moved my", fired)
 
+    def test_key_after_an_escape_written_as_text_is_masked(self):
+        for pre in ("printf 'K\\n", "K\\t", "A\\u00e9", "A\\x41"):
+            self.assertNotIn(TOKEN, store.mask(pre + TOKEN), pre)
+            self.assertTrue(store.carries_secret(pre + TOKEN), pre)
+        self.assertFalse(store.carries_secret("xn" + TOKEN), "a key character before the prefix is not a boundary")
+
     def test_key_on_its_own_line_in_tool_arguments_is_masked(self):
         content = [{"type": "tool_use", "name": "Write", "input": {"file_path": "x", "content": "TOKENS\n" + TOKEN}}]
         self.assertNotIn(TOKEN, capture._reply(content))

@@ -192,9 +192,10 @@ It is a heuristic over one file, and it is wrong both ways:
 - **False positives:** any function named like a masker counts, so a `mask()` that formats a card number for
   display, fed its last four digits, is flagged (the one finding across 548 of the author's Python files).
   `df.mask(df[:5] > 0)` is flagged too. It errs toward flagging: clean text assigned to a name inside an `if`, a loop
-  or a `try` does not clear it, because another path may still carry the cut text.
+  a `try` or a `with` does not clear it, because another path may still carry the cut text.
 - **False negatives:** cuts made in another module or by a library (`textwrap.shorten`), cuts that reach the masker
-  through an object attribute or a dict entry, and walrus assignments are not followed. To add a check, write a function from source text to
+  through an object attribute or a dict entry, walrus assignments, and a name a function reads that is cut only
+  after the function is defined, are not followed. To add a check, write a function from source text to
 `[(line, message)]` and add it to `CHECKS`. Run it directly with `python3 hooks/ast_lessons.py check FILE...`.
 
 ## Prior art

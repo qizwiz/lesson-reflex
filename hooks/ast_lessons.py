@@ -50,7 +50,8 @@ def _call_name(call):
 
 FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 COMPS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
-SCOPES = FUNCS + COMPS  # a comprehension has its own scope in Python 3: its variable does not leak
+SCOPES = (*FUNCS, *COMPS, ast.ClassDef)  # a comprehension's variable does not leak; a class body's names are not
+# visible to the methods inside it (Python resolves those to the enclosing function or module)
 # the usual names for a function that masks secrets in text
 REDACTORS = ("redact", "mask", "scrub", "sanitize", "anonymize", "mask_secrets")
 
@@ -119,7 +120,7 @@ def _taint_at(timeline, upto, initial):
 
 
 def _scope_taint(scope: ast.AST, slicers: set[str], upto=None, initial=frozenset(), clear=True,
-                 record=None) -> set[str]:
+                 record=None, since=None) -> set[str]:
     """The names in SCOPE that may hold cut text at position UPTO (the whole scope when None), in source order:
     plain, annotated and augmented assignment, loop and comprehension variables (bound from what they iterate over),
     and a list a cut value is appended or extended into. A use only sees bindings before it.
@@ -140,6 +141,8 @@ def _scope_taint(scope: ast.AST, slicers: set[str], upto=None, initial=frozenset
     for n in nodes:
         if upto is not None and _pos(n) >= upto:
             break
+        if since is not None and _pos(n) < since:
+            continue
         if isinstance(n, (ast.For, ast.AsyncFor)):
             if _tainted(n.iter, slicers, tainted):
                 tainted |= set(_bound_names(n.target))
@@ -192,9 +195,10 @@ def slice_into_redact(src):
     parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
 
     def enclosing(node):
-        """The nearest scope that contains NODE (a function, lambda, comprehension or the module)."""
+        """The scope whose names NODE sees: the nearest function, lambda, comprehension or the module -- a class body
+        is skipped, as Python skips it."""
         up = parent.get(node)
-        while up is not None and not isinstance(up, SCOPES):
+        while up is not None and (not isinstance(up, SCOPES) or isinstance(up, ast.ClassDef)):
             up = parent.get(up)
         return up if up is not None else tree
 
@@ -207,7 +211,10 @@ def slice_into_redact(src):
         return cache[key]
 
     def params(scope):
-        """Names a function or lambda binds as its own parameters: they shadow anything inherited."""
+        """Names a scope binds before its body runs -- a function's or lambda's parameters, a comprehension's
+        variables: they shadow anything inherited (QA: `t = s[:9]; [redact(t) for t in texts]` was flagged)."""
+        if isinstance(scope, COMPS):
+            return {x for g in scope.generators for x in _bound_names(g.target)}
         a = getattr(scope, "args", None)
         if not isinstance(a, ast.arguments):
             return set()
@@ -225,8 +232,7 @@ def slice_into_redact(src):
             return frozenset()
         if id(scope) not in inherit_cache:
             outer = enclosing(scope)
-            seen = _taint_at(timeline(outer, True), _pos(scope), inherited(outer))
-            inherit_cache[id(scope)] = frozenset(seen - params(scope))
+            inherit_cache[id(scope)] = frozenset(seen_at(outer, scope) - params(scope))
         return inherit_cache[id(scope)]
 
     def outer_loop(node, scope):
@@ -238,17 +244,30 @@ def slice_into_redact(src):
             up = parent.get(up)
         return loop
 
-    for scope in scopes:
+    loop_cache: dict = {}
+
+    def seen_at(scope, node):
+        """What NODE (a call, or a nested scope's definition) sees of SCOPE's names. Outside a loop: bindings before
+        it. Inside one: what the loop started with, plus every cut made anywhere in the loop, because a cut made
+        later reaches it on the next pass (QA: a comprehension in the loop missed this) -- and a clean assignment
+        before the loop still counts (the final audit: it had been ignored for the whole scope)."""
         start = inherited(scope)
+        loop = outer_loop(node, scope)
+        if loop is None:
+            return _taint_at(timeline(scope, True), _pos(node), start)
+        key = (id(scope), id(loop))
+        if key not in loop_cache:
+            end = (getattr(loop, "end_lineno", None) or loop.lineno, getattr(loop, "end_col_offset", None) or 0)
+            before = _taint_at(timeline(scope, True), _pos(loop), start)
+            loop_cache[key] = frozenset(_scope_taint(scope, slicers, upto=(end[0], end[1] + 1), initial=before,
+                                                     clear=False, since=_pos(loop)))
+        return loop_cache[key]
+
+    for scope in scopes:
         for n in _own_nodes(scope):
             if not (isinstance(n, ast.Call) and _call_name(n) in REDACTORS):
                 continue
-            loop = outer_loop(n, scope)
-            if loop is not None:  # a cut made later in the loop reaches this call on the next pass
-                end = (getattr(loop, "end_lineno", loop.lineno) or loop.lineno, getattr(loop, "end_col_offset", 0) or 0)
-                tainted = _taint_at(timeline(scope, False), (end[0], end[1] + 1), start)
-            else:
-                tainted = _taint_at(timeline(scope, True), _pos(n), start)  # only bindings BEFORE the call
+            tainted = seen_at(scope, n)
             if any(_tainted(a, slicers, tainted) for a in [*n.args, *(k.value for k in n.keywords)]):
                 found.add((n.lineno, "text is cut before redact(): redact the whole text, then cut"))
     return sorted(found)
@@ -318,6 +337,16 @@ def selftest():
        lines("t = s[:9]\n\ndef h(t):\n    return redact(t)\n\ng = lambda x: mask(x)\nx = s[:5]\n") == [])
     ck("method-parameter-shadows-module-taint",
        lines("x = s[:5]\n\nclass C:\n    def m(self, x):\n        return mask(x)\n") == [])
+    ck("comprehension-variable-shadows-enclosing-taint",
+       lines("def f(s, texts):\n    t = s[:9]\n    log(t)\n    return [redact(t) for t in texts]\n") == [])
+    ck("clean-before-loop-still-clears",
+       lines("def f(s, xs):\n    t = s[:9]\n    log(t)\n    t = s\n    for x in xs:\n        redact(t)\n") == [])
+    ck("loop-carried-cut-into-comprehension",
+       lines("def f(s, n):\n    t = s\n    for _ in range(n):\n        ys = [redact(t) for _ in 'ab']\n"
+             "        t = s[:9]\n") == [4])
+    ck("class-body-name-not-seen-by-method",
+       lines("t = 'ok'\n\nclass C:\n    t = s[:9]\n\n    def m(self):\n        return redact(t)\n") == [])
+    ck("class-body-call-checked", lines("class C:\n    t = s[:9]\n    u = redact(t)\n") == [3])
     ck("lambda-sees-enclosing-taint", lines("def f(p):\n    t = p[:600]\n    g = lambda: redact(t)\n"
                                             "    return g\n") == [3])
     ck("nested-def-sees-enclosing-taint", lines("def f(p):\n    t = p[:9]\n    def g():\n"

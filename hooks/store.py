@@ -6,7 +6,7 @@ Everything lives under $LESSON_REFLEX_HOME (default ~/.claude/lesson-reflex), cr
                      announced: a correction, a hindsight error or a tool-failure mistake
   dismissed.txt      correction ids marked "the judge misread this"
   inbox/<session>    correction ids waiting to be announced to that session (consumed when announced)
-  fired.json         {session: [keys already injected]} -- each lesson fires once per session
+  fired.json         {session/agent: [keys already injected]} -- each lesson fires once per session and agent
   failures-seen.jsonl  hashed (session, program) keys already sent to the failure judge
   hindsight-seen.jsonl replies already sent to the hindsight judge
   ast-fired.json     {session: [structural findings already shown]}, written under ast.lock
@@ -110,6 +110,22 @@ def locked(name="state.lock"):
         os.close(fd)
 
 
+HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def at_boundary(text, i):
+    """PURE: can a token start at TEXT[i]? At the start, after a non-key character, or right after a backslash escape
+    written out as text -- `\\n`, `\\t`, `\\xHH`, `\\uXXXX` -- whose last character is a letter or digit that
+    would otherwise read as part of the key (the final audit: `printf 'K\\nsk-ant-...'` and JSON text kept the key)."""
+    if i == 0 or text[i - 1] not in KEY:
+        return True
+    if i >= 2 and text[i - 2] == "\\":
+        return True
+    if i >= 4 and text[i - 4:i - 2] == "\\x" and all(c in HEX for c in text[i - 2:i]):
+        return True
+    return i >= 6 and text[i - 6:i - 4] in ("\\u", "\\U") and all(c in HEX for c in text[i - 4:i])
+
+
 def carries_secret(text):
     """PURE: does TEXT contain a token that starts with a known credential prefix and continues with enough key
     characters to be a real key?"""
@@ -117,21 +133,21 @@ def carries_secret(text):
     for prefix, allowed, minimum, exact in SECRET_SHAPES:
         start = text.find(prefix)
         while start >= 0:
-            at_boundary = start == 0 or text[start - 1] not in KEY
+            boundary = at_boundary(text, start)
             tail = ""
             for ch in text[start + len(prefix):]:
                 if ch not in allowed:
                     break
                 tail += ch
             long_enough = len(tail) == exact if exact else len(tail) >= minimum
-            if at_boundary and long_enough and any(ch.isdigit() for ch in tail):
+            if boundary and long_enough and any(ch.isdigit() for ch in tail):
                 return True
             start = text.find(prefix, start + 1)
     return False
 
 
 def mask_values(obj):
-    """PURE: OBJ with every string inside it masked -- for structured input (tool arguments) that is about to become
+    """PURE: OBJ with every string VALUE inside it masked (dictionary keys are left as they are) -- for structured input (tool arguments) that is about to become
     JSON. Masking after json.dumps misses a key on its own line: the newline becomes the two characters \\n, and the
     n before the key is a key character, so the token has no boundary."""
     if isinstance(obj, str):
@@ -159,7 +175,7 @@ def mask_once(text):
     out, i = [], 0
     while i < len(text):
         hit = 0
-        if i == 0 or text[i - 1] not in KEY:
+        if at_boundary(text, i):
             for prefix, allowed, minimum, exact in SECRET_SHAPES:
                 if text.startswith(prefix, i):
                     tail = 0
