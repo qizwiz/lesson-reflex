@@ -7,6 +7,9 @@ Everything lives under $LESSON_REFLEX_HOME (default ~/.claude/lesson-reflex), cr
   dismissed.txt      correction ids marked "the judge misread this"
   inbox/<session>    correction ids waiting to be announced to that session (consumed when announced)
   fired.json         {session: [keys already injected]} -- each lesson fires once per session
+  failures-seen.jsonl  hashed (session, program) keys already sent to the failure judge
+  hindsight-seen.jsonl replies already sent to the hindsight judge
+  ast-fired.json     {session: [structural findings already shown]}, written under ast.lock
 """
 import contextlib
 import fcntl
@@ -125,6 +128,19 @@ def carries_secret(text):
                 return True
             start = text.find(prefix, start + 1)
     return False
+
+
+def mask_values(obj):
+    """PURE: OBJ with every string inside it masked -- for structured input (tool arguments) that is about to become
+    JSON. Masking after json.dumps misses a key on its own line: the newline becomes the two characters \\n, and the
+    n before the key is a key character, so the token has no boundary."""
+    if isinstance(obj, str):
+        return mask(obj)
+    if isinstance(obj, dict):
+        return {k: mask_values(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [mask_values(v) for v in obj]
+    return obj
 
 
 def mask(text):

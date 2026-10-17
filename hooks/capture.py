@@ -39,7 +39,7 @@ def _reply(content):
         if p.get("type") == "text":
             out.append(p.get("text", ""))
         elif p.get("type") == "tool_use":
-            out.append(f"[tool {p.get('name', '?')}: {json.dumps(p.get('input', {}))}]")  # whole: masked, then cut
+            out.append(f"[tool {p.get('name', '?')}: {json.dumps(store.mask_values(p.get('input', {})))}]")  # values masked before escaping
     return "\n".join(x for x in out if x.strip())
 
 

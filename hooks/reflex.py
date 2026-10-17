@@ -90,9 +90,9 @@ def build(tool, text, lessons, corrections, fired, inbox, dismissed=frozenset())
             continue
         kind = by_id[cid].get("kind")
         template = {"hindsight": HINDSIGHT_MINT, "failure": FAILURE_MINT}.get(kind, MINT)
-        text = str(by_id[cid].get("prompt", ""))
+        said = str(by_id[cid].get("prompt", ""))
         out.append(template.format(cli=shlex.quote(CLI), cid=cid,
-                                   prompt=text[-160:] if kind == "hindsight" else text[:160]))
+                                   prompt=said[-160:] if kind == "hindsight" else said[:160]))
         now.add(key)
     for r in store.matching(tool, text, lessons):
         key = r["tool"] + ":" + r["needle"]

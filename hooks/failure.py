@@ -18,7 +18,8 @@ sys.path.insert(0, HERE)
 import store  # noqa: E402
 
 WRAPPERS = ("cd", "export", "time", "env", "sudo", "nohup", "nice", "timeout", "exec", "command", "xargs")
-FLAG_TAKES_VALUE = ("-u", "-g", "-n", "-C")  # sudo -u USER, sudo -g GROUP, nice -n N, git -C DIR
+FLAG_TAKES_VALUE = ("-u", "-g", "-n", "-C", "-s", "-k", "-I", "-P", "-L")
+# sudo -u USER / -g GROUP, nice -n N, git -C DIR, timeout -s SIGNAL / -k DURATION, xargs -I REPL / -P N / -L N
 SHELL_WORDS = ("if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "case", "esac", "!", "{",
                "}", "(", ")")
 
@@ -72,7 +73,7 @@ def job_for(ev):
         if key in seen:
             return None
         store.append_jsonl(store.path("failures-seen.jsonl"), {"key": key})
-    action = str(ti.get("command") or "") if tool == "Bash" else json.dumps(ti)
+    action = str(ti.get("command") or "") if tool == "Bash" else json.dumps(store.mask_values(ti))
     # whole texts: the judge masks, THEN cuts (cutting here could split a credential below the length mask() sees)
     return {"kind": "failure", "session": session, "tool": tool, "program": prog, "action": action,
             "description": str(ti.get("description") or ""), "error": str(ev.get("error") or ""),

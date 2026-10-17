@@ -130,6 +130,7 @@ def selftest():
 
     base = "def a(t):\n    return t\n\ndef h(x):\n    return redact(a(x))[:600]\n"
     with tempfile.TemporaryDirectory() as d:
+        os.environ["LESSON_REFLEX_HOME"] = d  # the lock file lands here, never in the real store
         f, st = os.path.join(d, "m.py"), os.path.join(d, "s.json")
         with open(f, "w") as fh:
             fh.write(base)

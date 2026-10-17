@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""judge -- was the user correcting Claude? One verdict per prompt, written to corrections.jsonl.
+"""judge -- one background verdict per job, written to corrections.jsonl. Three kinds of job:
+  correction (capture.py): was the user correcting Claude?      -> correction, request or other
+  hindsight  (hindsight.py): was Claude's previous reply wrong? -> error, fine or unclear
+  failure    (failure.py): was this failed call a mistake?      -> mistake, expected or environment
 
-Runs detached (capture.py starts it). Input on stdin: {"session", "prompt", "previous"}.
+Runs detached (store.spawn_judge starts it). Input on stdin: the job as JSON, with a "kind" field (absent = correction).
 The default judge is a headless `claude -p`, sealed: --safe-mode (no hooks, plugins, skills, CLAUDE.md or memory;
 admin-managed policy settings still apply), no tools, no MCP servers, --no-session-persistence (no transcript is
 saved), run from a fresh empty directory. The texts go to it on stdin, never on the command line, where any local
 user could read them with `ps`.
 Replace it with any command: set LESSON_REFLEX_JUDGE to a program that reads the same JSON on stdin and prints one
-word: correction, request or other.
+of the words for its kind (see README); it gets the texts unmasked and uncut.
 At most MAX_JUDGES run at once; a prompt that finds every slot busy is recorded as verdict "busy", not judged.
 """
 import fcntl
@@ -159,9 +162,9 @@ def run_judge(job, run=subprocess.run, base=None):
 def corrected_already(job):
     """Did the correction judge already flag the user's message that started this turn? Then the hindsight error
     about the reply before it is the same mistake, and is not announced a second time."""
-    said = store.mask(str(job.get("prompt", "")))[:600]
+    said = store.mask(str(job.get("prompt", "")).strip())[:600]
     return any(r.get("kind", "correction") == "correction" and r.get("verdict") == "correction"
-               and r.get("session") == job.get("session") and r.get("prompt") == said
+               and r.get("session") == job.get("session") and str(r.get("prompt", "")).strip() == said.strip()
                for r in store.read_jsonl(store.path("corrections.jsonl"))[-200:])
 
 

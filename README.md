@@ -104,7 +104,8 @@ still shows up in `lesson pending`.
 to): the failed action, its description and the error (masked, then cut to 4000, 300 and 2000 characters) go to the
 judge, which answers `mistake`, `expected` or `environment`. A call interrupted by the user is skipped; that is a
 correction, which the correction capture reads. The "program" a Bash failure is counted under is its first command
-word after wrappers such as `sudo`, `env`, `time` and `timeout`.
+word after wrappers such as `sudo`, `env`, `time`, `timeout` and `xargs`, with their flags and values (`timeout
+-s KILL 5 ls` is `ls`).
 Measured on 40 of the author's real failed Bash calls, hand-labelled before any model saw them (6 were mistakes):
 the default sonnet judge caught all 6, and also called 11 of the 34 benign failures mistakes. (That sample kept only
 each call's description and a cut error, not the command itself.) Expect most real mistakes to be caught and some
@@ -115,9 +116,10 @@ turn -- its text and its tool calls, including their arguments (shell commands, 
 last 2000 characters -- and what followed: your message (up to 2000 characters), then this turn's tool calls, their
 results and its reply (the last 2500 characters). Everything is masked for credential-shaped tokens first, then cut.
 The judge answers `error`, `fine` or `unclear`. An `error` is announced at Claude's next tool call and listed by
-`lesson pending` like a correction; if you already corrected that reply yourself, it is recorded as a `duplicate` and
-not announced twice. Each reply is judged once. A turn is skipped when it was not started by something you typed (a
-harness message, an image alone) or when the newest 400 KB of the transcript does not reach back to the previous
+`lesson pending` like a correction; if you already corrected that reply yourself and the correction judge has
+answered by then (it usually has: it starts when you send the message, the hindsight judge when the turn ends), it is
+recorded as a `duplicate` and not announced again. Each reply is judged once. A turn is skipped when it was not
+started by a message you typed (a harness message, a slash command, an image alone) or when the newest 400 KB of the transcript does not reach back to the previous
 turn. The hindsight hook never blocks the end of a turn.
 
 Each judge call is a small model request. To change the judge:
@@ -162,8 +164,9 @@ private (0700) and its files 0600. Delete the directory to start over.
 | file | what it holds |
 |---|---|
 | `lessons.jsonl` | your lessons |
-| `corrections.jsonl` | one row per judgement (id, session id, kind, verdict, time). Text is kept **only** for a correction (your prompt's first 600 characters), a hindsight error (the last 600 characters of the reply that was wrong) or a tool-failure mistake (the action's first 600 characters), with credential-shaped tokens masked before it is cut. |
-| `failures-seen.jsonl` | one row per program per session already sent to the failure judge: a hash of the session id and a hash of the program name. It grows by a row per new program per session and is not trimmed (only the last 2000 rows are read). |
+| `corrections.jsonl` | one row per judgement (id, session id, kind, verdict, time). Text is kept **only** for a correction (your prompt's first 600 characters), a hindsight error (the last 600 characters of the reply that was wrong) or a tool-failure mistake (the action's first 600 characters, plus the program name's first 80), with
+credential-shaped tokens masked before it is cut (in tool arguments, each value is masked before it is written as JSON). |
+| `failures-seen.jsonl` | one row per program per session already sent to the failure judge: a hash of the session id and a hash of the program name. A program is marked when it is sent, so if every judge slot was busy it is not judged again that session. It grows by a row per new program per session and is not trimmed (only the last 2000 rows are read). |
 | `hindsight-seen.jsonl` | one row per reply already sent to the hindsight judge (hashes only), so a reply is judged once |
 | `ast-fired.json` | which structural findings each recent session has already been shown |
 | `dismissed.txt` | ids of corrections you dismissed |
@@ -180,13 +183,16 @@ one per newly failing program -- and nothing trims it.
 (`redact`, `mask`, `scrub`, `sanitize`, `anonymize`, `mask_secrets`), so a credential straddling the cut becomes a
 fragment too short to recognise and is stored or sent. It follows the value through local names, lists it is
 appended to, tuple unpacking, loop and comprehension variables, and functions that return cut text, within one
-file; a use only sees what was bound before it. That bug recurred five times while this plugin was being built,
+file. Each function, lambda and comprehension is its own scope: it sees what its enclosing scope had bound where it
+is defined, and its own parameters shadow that. A use sees only what was bound before it, except inside a loop, where
+a cut made later in the loop reaches the next pass. That bug recurred five times while this plugin was being built,
 which is why it is the first.
 
 It is a heuristic over one file, and it is wrong both ways:
 - **False positives:** any function named like a masker counts, so a `mask()` that formats a card number for
   display, fed its last four digits, is flagged (the one finding across 548 of the author's Python files).
-  `df.mask(df[:5] > 0)` is flagged too.
+  `df.mask(df[:5] > 0)` is flagged too. It errs toward flagging: clean text assigned to a name inside an `if`, a loop
+  or a `try` does not clear it, because another path may still carry the cut text.
 - **False negatives:** cuts made in another module or by a library (`textwrap.shorten`), cuts that reach the masker
   through an object attribute or a dict entry, and walrus assignments are not followed. To add a check, write a function from source text to
 `[(line, message)]` and add it to `CHECKS`. Run it directly with `python3 hooks/ast_lessons.py check FILE...`.

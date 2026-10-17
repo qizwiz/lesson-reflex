@@ -49,18 +49,20 @@ def _call_name(call):
 
 
 FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+COMPS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+SCOPES = FUNCS + COMPS  # a comprehension has its own scope in Python 3: its variable does not leak
 # the usual names for a function that masks secrets in text
 REDACTORS = ("redact", "mask", "scrub", "sanitize", "anonymize", "mask_secrets")
 
 
 def _own_nodes(scope):
-    """Nodes of SCOPE, NOT descending into nested functions -- each function is its own scope, so a tainted name in
-    one function never flags a same-named parameter in another."""
+    """Nodes of SCOPE, NOT descending into nested functions, lambdas or comprehensions -- each is its own scope, so a
+    tainted name in one never flags a same-named name in another."""
     stack = list(ast.iter_child_nodes(scope))
     while stack:
         n = stack.pop()
         yield n
-        if not isinstance(n, FUNCS):
+        if not isinstance(n, SCOPES):
             stack.extend(ast.iter_child_nodes(n))
 
 
@@ -89,38 +91,65 @@ def _bound_names(target):
     return []
 
 
-COMPS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
-
-
 def _pos(n):
     return (getattr(n, "lineno", 0), getattr(n, "col_offset", 0))
 
 
-def _scope_taint(scope: ast.AST, slicers: set[str], upto=None, initial=frozenset()) -> set[str]:
-    """The names in SCOPE that hold cut text at position UPTO (the whole scope when None), in source order: plain,
-    annotated (`t: str = p[:600]`) and augmented assignment, loop and comprehension variables (bound from what they
-    iterate over), and a list a cut value is appended or extended into. Clean text bound to a name clears it, and a
-    use only sees bindings that come before it."""
+def _timeline(scope: ast.AST, slicers: set[str], initial=frozenset(), clear=True):
+    """(positions, states): the taint state after each node of SCOPE, in source order -- ONE pass per scope, so a
+    file with many masking calls costs n log n, not calls x n (the per-call re-walk took 35 s for 1500 calls)."""
+    positions: list = []
+    states: list = []
+
+    def record(pos, st):
+        positions.append(pos)
+        states.append(frozenset(st))
+
+    _scope_taint(scope, slicers, initial=initial, clear=clear, record=record)
+    return positions, states
+
+
+def _taint_at(timeline, upto, initial):
+    """The taint state from TIMELINE as of position UPTO: after the last node strictly before it."""
+    import bisect
+
+    positions, states = timeline
+    k = bisect.bisect_left(positions, upto)
+    return states[k - 1] if k else frozenset(initial)
+
+
+def _scope_taint(scope: ast.AST, slicers: set[str], upto=None, initial=frozenset(), clear=True,
+                 record=None) -> set[str]:
+    """The names in SCOPE that may hold cut text at position UPTO (the whole scope when None), in source order:
+    plain, annotated and augmented assignment, loop and comprehension variables (bound from what they iterate over),
+    and a list a cut value is appended or extended into. A use only sees bindings before it.
+
+    Conservative, because a miss is a leak: clean text clears a name ONLY when the assignment is an unconditional
+    statement directly in this scope's body (QA: a clean assignment inside an `if` or a loop had hidden a cut value
+    that still reaches redact() on another path), and never when CLEAR is false."""
     tainted: set[str] = set(initial)
+    body = getattr(scope, "body", None)  # a lambda's body is one expression, not a statement list
+    direct = {id(st) for st in body} if isinstance(body, list) else set()
+    if isinstance(scope, COMPS):
+        for g in scope.generators:
+            if _tainted(g.iter, slicers, tainted):
+                tainted |= set(_bound_names(g.target))
+    if record is not None:  # the state on entry (a comprehension's variables are bound before its body runs)
+        record((0, -1), tainted)
     nodes = sorted((n for n in _own_nodes(scope) if hasattr(n, "lineno")), key=_pos)
     for n in nodes:
         if upto is not None and _pos(n) >= upto:
             break
-        if isinstance(n, (ast.For, ast.AsyncFor, *COMPS)):
-            gens = [n] if isinstance(n, (ast.For, ast.AsyncFor)) else n.generators
-            for g in gens:
-                names = set(_bound_names(g.target))
-                if _tainted(g.iter, slicers, tainted):
-                    tainted |= names
-                else:
-                    tainted -= names
+        if isinstance(n, (ast.For, ast.AsyncFor)):
+            if _tainted(n.iter, slicers, tainted):
+                tainted |= set(_bound_names(n.target))
         elif isinstance(n, ast.Assign):
             # names a value lands in: plain names and `a, b = f()` unpacking -- not self.x or d[k], which would
-            # taint the whole object. Clean text assigned to a name clears its taint.
+            # taint the whole object
             names = {x for t in n.targets for x in _bound_names(t)}
             if _tainted(n.value, slicers, tainted):
                 tainted |= names
-            else:
+            elif clear and id(n) in direct:
                 tainted -= names
         elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and n.value is not None \
                 and isinstance(n.target, ast.Name) and _tainted(n.value, slicers, tainted):
@@ -128,6 +157,8 @@ def _scope_taint(scope: ast.AST, slicers: set[str], upto=None, initial=frozenset
         elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("append", "extend", "insert")
               and isinstance(n.func.value, ast.Name) and any(_tainted(a, slicers, tainted) for a in n.args)):
             tainted.add(n.func.value.id)
+        if record is not None:
+            record(_pos(n), tainted)
     return tainted
 
 
@@ -142,7 +173,7 @@ def _slicers(tree: ast.AST) -> set[str]:
         for fn in funcs:
             if fn.name in out:
                 continue
-            tainted = _scope_taint(fn, out)
+            tainted = _scope_taint(fn, out, clear=False)
             if any(isinstance(r, ast.Return) and r.value is not None and _tainted(r.value, out, tainted)
                    for r in _own_nodes(fn)):
                 out.add(fn.name)
@@ -156,32 +187,68 @@ def slice_into_redact(src):
     tree = ast.parse(src)
     slicers = _slicers(tree)
     found = set()
-    # every function AND lambda is a scope of its own, so a lambda's body is inspected too (a lambda is not a place
-    # a slicer can be defined, but redact(s[:5]) inside one was missed once scopes stopped at nested functions)
-    scopes = [n for n in ast.walk(tree) if isinstance(n, FUNCS)] + [tree]
+    # every function, lambda and comprehension is a scope of its own, seeing what encloses it
+    scopes = [n for n in ast.walk(tree) if isinstance(n, SCOPES)] + [tree]
     parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
 
     def enclosing(node):
-        """The nearest scope that contains NODE (a function, lambda or the module)."""
+        """The nearest scope that contains NODE (a function, lambda, comprehension or the module)."""
         up = parent.get(node)
-        while up is not None and not isinstance(up, FUNCS):
+        while up is not None and not isinstance(up, SCOPES):
             up = parent.get(up)
         return up if up is not None else tree
 
+    cache: dict = {}
+
+    def timeline(scope, clear):
+        key = (id(scope), clear)
+        if key not in cache:
+            cache[key] = _timeline(scope, slicers, initial=inherited(scope), clear=clear)
+        return cache[key]
+
+    def params(scope):
+        """Names a function or lambda binds as its own parameters: they shadow anything inherited."""
+        a = getattr(scope, "args", None)
+        if not isinstance(a, ast.arguments):
+            return set()
+        names = [x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)]
+        names += [x.arg for x in (a.vararg, a.kwarg) if x is not None]
+        return set(names)
+
+    inherit_cache: dict = {}
+
     def inherited(scope):
-        """What a nested function or lambda sees from the scope that encloses it, as of where it is defined
-        (QA: `t = p[:600]; g = lambda: redact(t)` was missed once lambdas became their own scopes)."""
+        """What a nested scope sees from the one that encloses it, as of where it is defined (QA: `t = p[:600];
+        g = lambda: redact(t)` was missed once lambdas became their own scopes) -- minus its own parameters (the
+        final audit: a module-level `t = s[:9]` flagged `def h(t): return redact(t)`)."""
         if scope is tree:
             return frozenset()
-        outer = enclosing(scope)
-        return frozenset(_scope_taint(outer, slicers, upto=_pos(scope), initial=inherited(outer)))
+        if id(scope) not in inherit_cache:
+            outer = enclosing(scope)
+            seen = _taint_at(timeline(outer, True), _pos(scope), inherited(outer))
+            inherit_cache[id(scope)] = frozenset(seen - params(scope))
+        return inherit_cache[id(scope)]
+
+    def outer_loop(node, scope):
+        """The outermost for/while loop around NODE inside SCOPE, or None."""
+        loop, up = None, parent.get(node)
+        while up is not None and up is not scope:
+            if isinstance(up, (ast.For, ast.AsyncFor, ast.While)):
+                loop = up
+            up = parent.get(up)
+        return loop
 
     for scope in scopes:
         start = inherited(scope)
         for n in _own_nodes(scope):
             if not (isinstance(n, ast.Call) and _call_name(n) in REDACTORS):
                 continue
-            tainted = _scope_taint(scope, slicers, upto=_pos(n), initial=start)  # only bindings BEFORE the call
+            loop = outer_loop(n, scope)
+            if loop is not None:  # a cut made later in the loop reaches this call on the next pass
+                end = (getattr(loop, "end_lineno", loop.lineno) or loop.lineno, getattr(loop, "end_col_offset", 0) or 0)
+                tainted = _taint_at(timeline(scope, False), (end[0], end[1] + 1), start)
+            else:
+                tainted = _taint_at(timeline(scope, True), _pos(n), start)  # only bindings BEFORE the call
             if any(_tainted(a, slicers, tainted) for a in [*n.args, *(k.value for k in n.keywords)]):
                 found.add((n.lineno, "text is cut before redact(): redact the whole text, then cut"))
     return sorted(found)
@@ -241,6 +308,16 @@ def selftest():
                             "        redact(c)\n") == [3])
     ck("chunks-comprehension", lines("def f(chunks):\n    cut = [x[:9] for x in chunks]\n"
                                      "    return [redact(c) for c in cut]\n") == [3])
+    ck("comprehension-variable-does-not-leak",
+       lines("def f(chunks, c):\n    cut = [c for c in [x[:9] for x in chunks]]\n    return redact(c)\n") == [])
+    ck("conditional-clean-assignment-does-not-clear",
+       lines("def f(s, ok):\n    t = s[:9]\n    if ok:\n        t = s\n    return redact(t)\n") == [5])
+    ck("loop-carried-cut", lines("def f(s, n):\n    t = s\n    for _ in range(n):\n        redact(t)\n"
+                                 "        t = s[:9]\n") == [4])
+    ck("parameter-shadows-enclosing-taint",
+       lines("t = s[:9]\n\ndef h(t):\n    return redact(t)\n\ng = lambda x: mask(x)\nx = s[:5]\n") == [])
+    ck("method-parameter-shadows-module-taint",
+       lines("x = s[:5]\n\nclass C:\n    def m(self, x):\n        return mask(x)\n") == [])
     ck("lambda-sees-enclosing-taint", lines("def f(p):\n    t = p[:600]\n    g = lambda: redact(t)\n"
                                             "    return g\n") == [3])
     ck("nested-def-sees-enclosing-taint", lines("def f(p):\n    t = p[:9]\n    def g():\n"

@@ -106,6 +106,10 @@ class Pure(unittest.TestCase):
         row = judge.record(job, "mistake")
         self.assertNotIn(TOKEN[:9], json.dumps(row), "neither the action nor the program field holds the token")
 
+    def test_failure_program_skips_wrapper_values(self):
+        for cmd in ("timeout -s KILL 5 ls", "xargs -I {} ls {}", "timeout -k 3 10 ls"):
+            self.assertEqual(failure.program("Bash", {"command": cmd}), "ls", cmd)
+
     def test_failure_program_skips_wrappers(self):
         for cmd, want in (("env -i FOO=1 make", "make"), ("sudo -u root ls", "ls"), ("time -p ls", "ls"),
                           ("{ ls; }", "ls"), ("timeout 10 pytest", "pytest"), ("nice -n 5 make", "make")):
@@ -177,6 +181,27 @@ class Pure(unittest.TestCase):
     def test_relative_judge_path_resolves_against_the_caller(self):
         self.assertEqual(judge.custom_argv("./ok --x", "/work")[0], "/work/ok")
         self.assertEqual(judge.custom_argv("ok", "/work")[0], "ok", "a bare name still goes through PATH")
+
+    def test_announcement_does_not_replace_the_action_text(self):
+        lessons = [{"tool": "Bash", "needle": "pop-to-buffer", "lesson": "x" * 25},
+                   {"tool": "Bash", "needle": "moved my", "lesson": "y" * 25}]
+        cs = [{"id": "a", "verdict": "correction", "prompt": "no, that moved my cursor"}]
+        _, fired = reflex.build("Bash", "emacs pop-to-buffer", lessons, cs, set(), ["a"])
+        self.assertIn("Bash:pop-to-buffer", fired)
+        self.assertNotIn("Bash:moved my", fired)
+
+    def test_key_on_its_own_line_in_tool_arguments_is_masked(self):
+        content = [{"type": "tool_use", "name": "Write", "input": {"file_path": "x", "content": "TOKENS\n" + TOKEN}}]
+        self.assertNotIn(TOKEN, capture._reply(content))
+        job = failure.job_for({"tool_name": "Write", "session_id": "M", "error": "e",
+                               "tool_input": {"file_path": "x", "content": "TOKENS\n" + TOKEN}})
+        self.assertNotIn(TOKEN, job["action"])
+
+    def test_duplicate_found_despite_trailing_whitespace(self):
+        judge.record({"session": "W", "prompt": "no, that's wrong", "previous": "p"}, "correction")
+        dup = judge.record({"kind": "hindsight", "session": "W", "reply": "p", "prompt": "no, that's wrong\n",
+                            "follow": "f"}, "error")
+        self.assertEqual(dup["verdict"], "duplicate")
 
     def test_once_per_session(self):
         lessons = [{"tool": "Bash", "needle": "git push", "lesson": "x" * 25}]
