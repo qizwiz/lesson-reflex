@@ -16,6 +16,7 @@ sys.path.insert(0, HOOKS)
 _HOME = tempfile.TemporaryDirectory()
 os.environ["LESSON_REFLEX_HOME"] = os.path.join(_HOME.name, "home")
 import capture  # noqa: E402
+import hindsight  # noqa: E402
 import judge  # noqa: E402
 import reflex  # noqa: E402
 import store  # noqa: E402
@@ -25,13 +26,12 @@ TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # shaped like a key, no
 
 def run(script, ev, env):
     return subprocess.run([sys.executable, script], input=json.dumps(ev), capture_output=True, text=True,
-                          env=env, timeout=30)
+                          env=env, timeout=30, check=False)
 
 
 def transcript(path, rows):
     with open(path, "w") as fh:
-        for r in rows:
-            fh.write((r if isinstance(r, str) else json.dumps(r)) + "\n")
+        fh.writelines((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in rows)
 
 
 def said(text):
@@ -70,6 +70,16 @@ class Pure(unittest.TestCase):
             with open(p, "w") as fh:
                 fh.write('{bad\n{"a": 1}\n\n[1]\n{"b": 2}\n')
             self.assertEqual(store.read_jsonl(p), [{"a": 1}, {"b": 2}])
+
+    def test_hindsight_record_is_a_pending_correction(self):
+        row = judge.record({"kind": "hindsight", "session": "H", "reply": "x" * 700 + "THE END", "follow": "f"},
+                           "error")
+        self.assertEqual((row["verdict"], row["kind"]), ("correction", "hindsight"))
+        self.assertTrue(row["prompt"].endswith("THE END") and len(row["prompt"]) == 600)
+        fine = judge.record({"kind": "hindsight", "session": "H", "reply": "r", "follow": "f"}, "fine")
+        self.assertNotIn("prompt", fine, "only an error keeps text")
+        self.assertEqual(judge.parse("Error.", judge.HINDSIGHT_VERDICTS), "error")
+        self.assertEqual(judge.parse("correction", judge.HINDSIGHT_VERDICTS), "")
 
     def test_parse_verdict_reads_first_word_only(self):
         self.assertEqual(judge.parse("Correction."), "correction")
@@ -188,6 +198,27 @@ class Transcript(unittest.TestCase):
         transcript(self.tp, [typed("q0"), said("FIRST"), meta, said("SECOND")])
         self.assertEqual(capture.last_reply(self.tp), "FIRST\nSECOND")
 
+    def test_previous_and_follow(self):
+        transcript(self.tp, [typed("q0"), said("It changed 3 lines."), typed("no -- it was 156"),
+                             {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
+                                                                            "input": {"command": "git show --stat"}}]}},
+                             said("You're right: 156 lines.")])
+        reply, follow = capture.previous_and_follow(self.tp)
+        self.assertEqual(reply, "It changed 3 lines.")
+        self.assertIn("USER NEXT: no -- it was 156", follow)
+        self.assertIn("git show --stat", follow)
+        self.assertIn("You're right: 156 lines.", follow)
+
+    def test_no_previous_turn_no_hindsight(self):
+        transcript(self.tp, [typed("q0"), said("only one turn")])
+        self.assertEqual(capture.previous_and_follow(self.tp), ("", ""))
+        self.assertIsNone(hindsight.job_for({"transcript_path": self.tp, "session_id": "S"}))
+
+    def test_hindsight_skips_stop_hook_active(self):
+        transcript(self.tp, [typed("q0"), said("a"), typed("q1"), said("b")])
+        self.assertIsNone(hindsight.job_for({"transcript_path": self.tp, "stop_hook_active": True}))
+        self.assertEqual(hindsight.job_for({"transcript_path": self.tp, "session_id": "S"})["kind"], "hindsight")
+
     def test_interrupted_turn_is_judged(self):
         transcript(self.tp, [typed("clean up"), said("Cleaning the cache directory."),
                              {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
@@ -263,10 +294,10 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(rows[0]["prompt"], "no, it moved my cursor")
         add = subprocess.run([sys.executable, CLI, "add", "--tool", "Bash", "--needle", " deploy-prod ",
                               "--lesson", "run the dry run first; the real deploy broke staging",
-                              "--source", "correction:" + rows[0]["id"]], capture_output=True, text=True, env=self.env)
+                              "--source", "correction:" + rows[0]["id"]], capture_output=True, text=True, env=self.env, check=False)
         self.assertEqual(add.returncode, 0, add.stderr)
         self.assertEqual(store.read_jsonl(os.path.join(self.home, "lessons.jsonl"))[0]["needle"], "deploy-prod")
-        pend = subprocess.run([sys.executable, CLI, "pending"], capture_output=True, text=True, env=self.env).stdout
+        pend = subprocess.run([sys.executable, CLI, "pending"], capture_output=True, text=True, env=self.env, check=False).stdout
         self.assertIn("0 correction(s)", pend)
         fire = run(os.path.join(HOOKS, "reflex.py"),
                    {"tool_name": "Bash", "tool_input": {"command": "x deploy-prod y"}, "session_id": "S3"}, self.env)
@@ -294,7 +325,7 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(self.wait_for(path))
         time.sleep(0.2)
         self.assertEqual(store.read_jsonl(path)[0]["verdict"], "error")
-        pend = subprocess.run([sys.executable, CLI, "pending"], capture_output=True, text=True, env=self.env).stdout
+        pend = subprocess.run([sys.executable, CLI, "pending"], capture_output=True, text=True, env=self.env, check=False).stdout
         self.assertIn("did not answer 1 of the last 1", pend)
 
     def test_concurrent_sessions_lose_nothing(self):
@@ -341,18 +372,34 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(store.read_jsonl(path)[0]["verdict"], "error")
 
     def test_dismiss_requires_a_known_correction(self):
-        r = subprocess.run([sys.executable, CLI, "dismiss", "nope"], capture_output=True, text=True, env=self.env)
+        r = subprocess.run([sys.executable, CLI, "dismiss", "nope"], capture_output=True, text=True, env=self.env, check=False)
         self.assertEqual(r.returncode, 64)
         store.append_jsonl(os.path.join(self.home, "corrections.jsonl"), {"id": "r1", "verdict": "request"})
-        r = subprocess.run([sys.executable, CLI, "dismiss", "r1"], capture_output=True, text=True, env=self.env)
+        r = subprocess.run([sys.executable, CLI, "dismiss", "r1"], capture_output=True, text=True, env=self.env, check=False)
         self.assertEqual(r.returncode, 64, "only a correction can be dismissed")
 
     def test_rm_strips_the_needle_like_add(self):
         subprocess.run([sys.executable, CLI, "add", "--tool", "Bash", "--needle", " deploy-prod ", "--lesson",
-                        "x" * 25], capture_output=True, env=self.env)
+                        "x" * 25], capture_output=True, env=self.env, check=False)
         r = subprocess.run([sys.executable, CLI, "rm", "Bash", " deploy-prod "], capture_output=True, text=True,
-                           env=self.env)
+                           env=self.env, check=False)
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_hindsight_flow(self):
+        stub = os.path.join(self.d.name, "err")
+        with open(stub, "w") as fh:
+            fh.write(f"#!/bin/sh\ncat >/dev/null\ntouch {self.marker}\necho error\n")
+        os.chmod(stub, 0o755)
+        transcript(self.tp, [typed("q0"), said("Done: it will not move your cursor."), typed("it moved my cursor"),
+                             said("You're right, it did.")])
+        env = dict(self.env, LESSON_REFLEX_JUDGE=stub)
+        r = run(os.path.join(HOOKS, "hindsight.py"), {"transcript_path": self.tp, "session_id": "H1"}, env)
+        self.assertEqual((r.returncode, r.stdout), (0, ""), "a Stop hook that never blocks or prints")
+        self.assertTrue(self.wait_for(os.path.join(self.home, "inbox", store.session_file("H1"))))
+        out = run(os.path.join(HOOKS, "reflex.py"), {"tool_name": "Read", "tool_input": {}, "session_id": "H1"},
+                  env).stdout
+        self.assertIn("PREVIOUS reply was wrong", out)
+        self.assertIn("not move your cursor", out)
 
     def test_judge_does_not_judge_itself(self):
         self.capture("no", env=dict(self.env, LESSON_REFLEX_JUDGING="1"))

@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import store  # noqa: E402
 
 VERDICTS = ("correction", "request", "other")
+HINDSIGHT_VERDICTS = ("error", "fine", "unclear")
 MODEL = os.environ.get("LESSON_REFLEX_MODEL", "sonnet")
 MAX_JUDGES = 3
 TIMEOUT = 60
@@ -44,7 +45,25 @@ Reply with exactly one word and nothing else: correction, request or other.
 </NEW_MESSAGE>"""
 
 
-def parse(out):
+HINDSIGHT_PROMPT = """You label one past reply. REPLY is what an assistant told the user. FOLLOW_UP is what happened next:
+the user's next message, then the assistant's next turn (its tool calls, their results, and its reply).
+
+error   = FOLLOW_UP shows REPLY was wrong, unsupported or overstated, or claimed work that was not done or did not work
+fine    = FOLLOW_UP shows no problem with REPLY: the user went on, asked for more, or confirmed it
+unclear = FOLLOW_UP does not show either way
+
+A user simply asking for more, or changing topic, is not an error. Reply with exactly one word: error, fine or unclear.
+
+<REPLY>
+{reply}
+</REPLY>
+
+<FOLLOW_UP>
+{follow}
+</FOLLOW_UP>"""
+
+
+def parse(out, verdicts=VERDICTS):
     """PURE: the verdict, read from the FIRST word of the output only (markdown and punctuation trimmed), or ''.
 
     Only the leading word counts, so "Not a correction" is not read as one; "correction—" and "**correction**" are.
@@ -55,7 +74,7 @@ def parse(out):
         if not ("a" <= ch <= "z"):
             break
         word += ch
-    return word if word in VERDICTS else ""
+    return word if word in verdicts else ""
 
 
 def judge_argv():
@@ -79,9 +98,15 @@ def run_judge(job, run=subprocess.run, base=None):
     The error never quotes the judge's output: a judge that echoes the prompt would otherwise store it."""
     env = dict(os.environ, LESSON_REFLEX_JUDGING="1", CLAUDE_CODE_DISABLE_AUTO_MEMORY="1")
     custom = os.environ.get("LESSON_REFLEX_JUDGE")
+    hindsight = job.get("kind") == "hindsight"
     try:
         argv = custom_argv(custom, base or os.getcwd()) if custom else judge_argv()
-        stdin = json.dumps(job) if custom else PROMPT.format(previous=job["previous"], prompt=job["prompt"])
+        if custom:
+            stdin = json.dumps(job)
+        elif hindsight:
+            stdin = HINDSIGHT_PROMPT.format(reply=job["reply"], follow=job["follow"])
+        else:
+            stdin = PROMPT.format(previous=job["previous"], prompt=job["prompt"])
         with tempfile.TemporaryDirectory() as cwd:
             r = run(argv, input=stdin, capture_output=True, text=True, errors="replace", timeout=TIMEOUT,
                     env=env, cwd=cwd)
@@ -95,18 +120,24 @@ def run_judge(job, run=subprocess.run, base=None):
         return "", f"judge failed: {type(e).__name__}"
     if r.returncode != 0:
         return "", f"judge exited {r.returncode}"
-    verdict = parse(r.stdout)
+    verdict = parse(r.stdout, HINDSIGHT_VERDICTS if hindsight else VERDICTS)
     return (verdict, "") if verdict else ("", f"judge answered off-format ({len(r.stdout or '')} characters)")
 
 
 def record(job, verdict, error=""):
-    """Ledger the verdict. Only a correction keeps the prompt text; it also goes to the session's inbox."""
-    row = {"id": store.new_id(), "session": job.get("session", ""), "verdict": verdict or "error",
+    """Ledger the verdict. Only a correction keeps text; it also goes to the session's inbox. A hindsight "error"
+    is recorded as a correction of kind hindsight, keeping the end of the reply that was wrong, so the inbox,
+    `lesson pending` and `lesson dismiss` work the same for both."""
+    kind = job.get("kind", "correction")
+    if kind == "hindsight" and verdict == "error":
+        verdict = "correction"
+    row = {"id": store.new_id(), "session": job.get("session", ""), "kind": kind, "verdict": verdict or "error",
            "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     if error:
         row["error"] = error
     if verdict == "correction":
-        row["prompt"] = str(job.get("prompt", ""))[:600]
+        text = job.get("reply", "")[-600:] if kind == "hindsight" else job.get("prompt", "")[:600]
+        row["prompt"] = str(text)
     store.append_jsonl(store.path("corrections.jsonl"), row)
     if verdict == "correction":
         store.add_to_inbox(row["session"], row["id"])
@@ -131,7 +162,10 @@ def main():
         job = json.load(sys.stdin)
     except ValueError:
         return 0
-    if not isinstance(job, dict) or "prompt" not in job or "previous" not in job:
+    if not isinstance(job, dict):
+        return 0
+    needs = ("reply", "follow") if job.get("kind") == "hindsight" else ("prompt", "previous")
+    if any(k not in job for k in needs):
         return 0
     try:
         slot = take_slot()

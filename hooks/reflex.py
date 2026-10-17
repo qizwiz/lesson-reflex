@@ -26,6 +26,14 @@ MINT = (
     "--lesson 'what to do instead, and what the mistake cost' --source correction:{cid}\n"
     "If it was not a correction: python3 {cli} dismiss {cid}"
 )
+HINDSIGHT_MINT = (
+    "[lesson-reflex] What followed shows your PREVIOUS reply was wrong (hindsight {cid}; it ended: {prompt!r}). "
+    "In one line, say what was wrong and fix it if it still matters. Then record the lesson so it fires next time at "
+    "the action where the mistake started.\nTOOL is one of Bash, Edit, MultiEdit, Write:\n"
+    "  python3 {cli} add --tool TOOL --needle 'TEXT IN THAT ACTION' "
+    "--lesson 'what to do instead, and what the mistake cost' --source correction:{cid}\n"
+    "If the reply was not wrong: python3 {cli} dismiss {cid}"
+)
 
 
 def action_text(tool, tool_input):
@@ -72,7 +80,9 @@ def build(tool, text, lessons, corrections, fired, inbox, dismissed=frozenset())
         key = "correction:" + cid
         if key in now or cid in closed or cid not in by_id:
             continue
-        out.append(MINT.format(cli=shlex.quote(CLI), cid=cid, prompt=str(by_id[cid].get("prompt", ""))[:160]))
+        template = HINDSIGHT_MINT if by_id[cid].get("kind") == "hindsight" else MINT
+        out.append(template.format(cli=shlex.quote(CLI), cid=cid, prompt=str(by_id[cid].get("prompt", ""))[-160:]
+                                   if by_id[cid].get("kind") == "hindsight" else str(by_id[cid].get("prompt", ""))[:160]))
         now.add(key)
     for r in store.matching(tool, text, lessons):
         key = r["tool"] + ":" + r["needle"]

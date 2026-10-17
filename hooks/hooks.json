@@ -1,5 +1,5 @@
 {
-  "description": "lesson-reflex: correction capture (UserPromptSubmit) + lessons fired at the action (PreToolUse)",
+  "description": "lesson-reflex: correction capture (UserPromptSubmit), hindsight (Stop), lessons fired at the action (PreToolUse)",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -19,6 +19,17 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/reflex.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/hindsight.py\"",
             "timeout": 5
           }
         ]

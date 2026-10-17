@@ -90,6 +90,41 @@ def last_reply(transcript_path, tail=TAIL):
     return "\n".join(reversed(parts))[-tail:]
 
 
+def previous_and_follow(transcript_path, tail=TAIL):
+    """(previous reply, follow-up) for hindsight: the reply that ended the PREVIOUS turn, and what followed it --
+    the user's message that started this turn, then this turn's tool calls and reply. ('', '') when there is no
+    previous turn. The follow-up's tool part is kept to the last TAIL characters, the reply to its last TAIL."""
+    try:
+        with open(transcript_path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 400_000))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except (OSError, TypeError, ValueError):
+        return "", ""
+    current, prompt, previous = [], None, []
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("type") == "user" and _is_boundary(row):
+            if prompt is None:
+                prompt = _text((row.get("message") or {}).get("content"))
+                continue
+            break
+        if row.get("type") == "assistant":
+            said = _reply((row.get("message") or {}).get("content"))
+            if said.strip():
+                (current if prompt is None else previous).append(said)
+    if prompt is None or not previous:
+        return "", ""
+    reply = "\n".join(reversed(previous))[-tail:]
+    turn = "\n".join(reversed(current))
+    return reply, f"USER NEXT: {prompt[:MAX_PROMPT]}\n\nASSISTANT NEXT: {turn[-tail:]}"
+
+
 def payload(ev):
     """The judge's input for this event, or None when there is nothing to judge."""
     if not isinstance(ev, dict):

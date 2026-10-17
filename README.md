@@ -8,6 +8,11 @@ the action where the mistake started (a command, a function name, a flag), and w
 whenever Claude is about to run a Bash command or write Edit/Write text containing that text, the lesson is shown
 to it, once per session (a subagent counts separately).
 
+It also catches mistakes nobody pointed out. At the end of each turn, the judge looks back at Claude's previous reply
+and what followed it: your next message, then the tools Claude ran and what it said. If that shows the reply was
+wrong, Claude is told at its next tool call, the same way as a correction. Hindsight works where foresight does not:
+asked *before* the fact whether a reply was about to be wrong, the same kind of judge did worse than chance.
+
 ```
 you: "no, that moved my cursor"
         │  UserPromptSubmit: capture.py hands your message + Claude's last reply to the judge, in the background
@@ -64,7 +69,9 @@ secret's shape, never its value.
 
 ## The judge
 
-Each prompt you type, once Claude has said or done something since your previous prompt, starts one judge call
+The judge answers two questions, each in the background so nothing waits on it.
+
+**Correction** (UserPromptSubmit): each prompt you type, once Claude has said or done something since your previous prompt, starts one judge call
 **in the background**, so your prompt never waits on it. At most 3 run at once; a prompt that arrives while all 3 are busy is recorded as `busy`
 and not judged.
 
@@ -83,15 +90,21 @@ The verdict takes several seconds (about 3 to 6 in the author's runs). It is ann
 may be later in the same turn or in the next one; subagents are never told. A correction that is never announced
 still shows up in `lesson pending`.
 
+**Hindsight** (Stop): at the end of each turn, the reply that ended the *previous* turn (up to 1500 characters) and what
+followed it (your message, then this turn's tool calls and reply, up to 1500 characters) go to the judge, which
+answers `error`, `fine` or `unclear`. An `error` is announced at Claude's next tool call and listed by `lesson pending`
+like a correction. The hindsight hook never blocks the end of a turn.
+
 Each judge call is a small model request. To change the judge:
 
 - `LESSON_REFLEX_MODEL=haiku`: cheaper, noisier.
-- `LESSON_REFLEX_JUDGE="your-command"`: any program that reads `{"session","prompt","previous","cwd"}` JSON on
-  stdin and prints `correction`, `request` or `other`. Only the leading word of its output is read. A relative path
+- `LESSON_REFLEX_JUDGE="your-command"`: any program that reads the job as JSON on stdin and prints one word. A
+  correction job is `{"session","prompt","previous","cwd"}` and wants `correction`, `request` or `other`; a hindsight
+  job is `{"kind":"hindsight","session","reply","follow","cwd"}` and wants `error`, `fine` or `unclear`. Only the leading word of its output is read. A relative path
   such as `./judge` is resolved against the session's working directory when the prompt was sent; quote a path
   containing spaces.
 
-If the judge fails (CLI missing, auth, timeout, an answer that isn't one of the three words), the prompt is
+If the judge fails (CLI missing, auth, timeout, an answer that isn't one of its three words), the job is
 recorded as `error` with the reason (never the judge's output), and `lesson pending` reports how many of the recent
 prompts went unjudged.
 
@@ -101,7 +114,12 @@ The author hand-labelled 29 of their own prompts, 5 of them corrections, before 
 - sonnet caught 3 of the 5 corrections, with no false alarms
 - haiku caught 4, and flagged 2 ordinary requests as corrections
 
-That is a small sample from one person, and the prompts are private, so the data is not in this repository. To
+For hindsight, the author labelled 120 of their own past turns with a stronger judge, Jev, and read the 5 most
+confident "error" labels by hand; all 5 were real. On 20 turns Jev labelled `error` and 20 it labelled `fine`, the
+default sonnet judge said `error` on 8 of the 20 errors (4 of the 5 clearest) and on 1 of the 20 fine turns. So
+expect its announcements to be mostly right, and expect it to miss more than half of the subtler errors.
+
+These are small samples from one person, and the transcripts are private, so the data is not in this repository. To
 score it on your own sessions: every verdict is in `corrections.jsonl`, and every `lesson dismiss` records a
 misread.
 
@@ -113,13 +131,13 @@ private (0700) and its files 0600. Delete the directory to start over.
 | file | what it holds |
 |---|---|
 | `lessons.jsonl` | your lessons |
-| `corrections.jsonl` | one row per judged prompt (id, session id, verdict, time). The prompt's text (first 600 characters) is kept **only** for prompts judged to be corrections. |
+| `corrections.jsonl` | one row per judgement (id, session id, kind, verdict, time). Text is kept **only** for a correction (your prompt's first 600 characters) or a hindsight error (the last 600 characters of the reply that was wrong). |
 | `dismissed.txt` | ids of corrections you dismissed |
 | `inbox/` | corrections waiting to be announced; each is removed once announced or closed. A session that ends before its next tool call leaves its file behind; `lesson pending` still lists the correction. |
 | `fired.json` | which lessons have already fired, for the 256 most recent entries (a session's main thread and each subagent are separate entries) |
 | `*.lock` | lock files that keep concurrent sessions and judges from overwriting each other |
 
-`corrections.jsonl` grows by one row per judged prompt, and nothing trims it.
+`corrections.jsonl` grows by one row per judgement (up to two per turn), and nothing trims it.
 
 ## Prior art
 
