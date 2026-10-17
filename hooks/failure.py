@@ -7,19 +7,26 @@ announced at the next tool call: find the fix, then record the lesson. At most o
 a second failure of the same command is the same lesson. An interrupted call is skipped -- that is the user
 correcting Claude, which the correction capture reads.
 """
+import hashlib
 import json
 import os
 import shlex
-import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import store  # noqa: E402
 
+WRAPPERS = ("cd", "export", "time", "env", "sudo", "nohup", "nice", "timeout", "exec", "command", "xargs")
+FLAG_TAKES_VALUE = ("-u", "-g", "-n", "-C")  # sudo -u USER, sudo -g GROUP, nice -n N, git -C DIR
+SHELL_WORDS = ("if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "case", "esac", "!", "{",
+               "}", "(", ")")
+
 
 def program(tool, tool_input):
-    """PURE: what failed, for once-per-session gating: the first program word of a Bash command, else the tool name."""
+    """PURE: what failed, for once-per-session gating: the first program word of a Bash command, else the tool name.
+    Wrappers (sudo, env, time, timeout, ...), their flags and values, VAR=value, shell keywords and operators are
+    skipped, so `sudo -u root ls` is `ls`, not `-u`."""
     if tool != "Bash":
         return tool
     cmd = str((tool_input or {}).get("command") or "")
@@ -29,15 +36,22 @@ def program(tool, tool_input):
         words = list(lex)
     except ValueError:
         words = cmd.split()
-    skip = False
+    skip_value = False
+    after_wrapper = False
     for w in words:
-        if skip:
-            skip = False
+        if skip_value:
+            skip_value = False
             continue
-        if w in ("cd", "export", "time", "env", "sudo", "nohup"):
-            skip = w == "cd"
+        if not w or w[0] in ";&|<>" or w in SHELL_WORDS or ("=" in w and not w.startswith("-") and "/" not in w.split("=")[0]):
             continue
-        if not w or w[0] in ";&|()<>" or "=" in w.split("/")[0]:
+        if w in WRAPPERS:
+            after_wrapper = True
+            skip_value = w == "cd"
+            continue
+        if w.startswith("-"):
+            skip_value = after_wrapper and w in FLAG_TAKES_VALUE
+            continue
+        if after_wrapper and w.isascii() and w.isdigit():  # timeout 10 CMD
             continue
         return os.path.basename(w)
     return "Bash"
@@ -48,10 +62,11 @@ def job_for(ev):
     if not isinstance(ev, dict) or ev.get("is_interrupt"):
         return None
     tool = str(ev.get("tool_name") or "")
-    ti = ev.get("tool_input") if isinstance(ev.get("tool_input"), dict) else {}
+    ti: dict = ev["tool_input"] if isinstance(ev.get("tool_input"), dict) else {}
     session = str(ev.get("session_id") or "")
     prog = program(tool, ti)
-    key = store.session_file(session) + ":failure:" + prog
+    # the program name is hashed in the key and masked in the row: a "program" can be a pasted credential
+    key = store.session_file(session) + ":failure:" + hashlib.sha256(prog.encode()).hexdigest()[:24]
     with store.locked("failure.lock"):
         seen = {r.get("key") for r in store.read_jsonl(store.path("failures-seen.jsonl"))[-2000:]}
         if key in seen:
@@ -71,10 +86,7 @@ def main():
         job = job_for(json.load(sys.stdin))
         if job is None:
             return 0
-        proc = subprocess.Popen([sys.executable, os.path.join(HERE, "judge.py")], stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        proc.stdin.write(json.dumps(job).encode())
-        proc.stdin.close()
+        store.spawn_judge(job)
     except Exception:  # noqa: BLE001 -- never break the turn
         return 0
     return 0

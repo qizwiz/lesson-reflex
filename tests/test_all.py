@@ -15,10 +15,10 @@ sys.path.insert(0, HOOKS)
 # The test process itself must never touch the real ~/.claude/lesson-reflex.
 _HOME = tempfile.TemporaryDirectory()
 os.environ["LESSON_REFLEX_HOME"] = os.path.join(_HOME.name, "home")
-import capture  # noqa: E402
-import hindsight  # noqa: E402
-import failure  # noqa: E402
 import ast_lessons  # noqa: E402
+import capture  # noqa: E402
+import failure  # noqa: E402
+import hindsight  # noqa: E402
 import judge  # noqa: E402
 import reflex  # noqa: E402
 import store  # noqa: E402
@@ -81,6 +81,36 @@ class Pure(unittest.TestCase):
         self.assertNotIn(TOKEN[:9], row["prompt"], "a credential straddling the 600-char cut is masked first")
         self.assertEqual((row["verdict"], row["kind"], row["program"]), ("correction", "failure", "curl"))
 
+    def test_correction_and_hindsight_announce_once(self):
+        judge.record({"session": "D", "prompt": "no, they fail", "previous": "tests pass"}, "correction")
+        dup = judge.record({"kind": "hindsight", "session": "D", "reply": "tests pass", "prompt": "no, they fail",
+                            "follow": "f"}, "error")
+        self.assertEqual(dup["verdict"], "duplicate")
+        self.assertNotIn(dup["id"], reflex.read_inbox("D"))
+
+    def test_judge_failure_is_not_a_hindsight_error(self):
+        row = judge.record({"kind": "hindsight", "session": "J", "reply": "r", "prompt": "p", "follow": "f"}, "",
+                           "judge exited 1")
+        self.assertEqual(row["verdict"], "judge-error")
+
+    def test_hindsight_text_is_masked_before_cut(self):
+        row = judge.record({"kind": "hindsight", "session": "M", "prompt": "p", "follow": "f",
+                            "reply": "[tool Bash: curl -H " + TOKEN + "] " + "y" * 590}, "error")
+        self.assertNotIn(TOKEN[:9], row["prompt"])
+
+    def test_failure_program_is_hashed_and_masked(self):
+        ev = {"tool_name": "Bash", "tool_input": {"command": TOKEN + " --help"}, "error": "e", "session_id": "TK"}
+        job = failure.job_for(ev)
+        with open(os.path.join(os.environ["LESSON_REFLEX_HOME"], "failures-seen.jsonl")) as fh:
+            self.assertNotIn(TOKEN[:9], fh.read())
+        row = judge.record(job, "mistake")
+        self.assertNotIn(TOKEN[:9], json.dumps(row), "neither the action nor the program field holds the token")
+
+    def test_failure_program_skips_wrappers(self):
+        for cmd, want in (("env -i FOO=1 make", "make"), ("sudo -u root ls", "ls"), ("time -p ls", "ls"),
+                          ("{ ls; }", "ls"), ("timeout 10 pytest", "pytest"), ("nice -n 5 make", "make")):
+            self.assertEqual(failure.program("Bash", {"command": cmd}), want, cmd)
+
     def test_failure_program_and_gating(self):
         self.assertEqual(failure.program("Bash", {"command": "cd ~/x && git -C y status"}), "git")
         self.assertEqual(failure.program("Bash", {"command": "FOO=1 python3 -c 'x'"}), "python3")
@@ -100,11 +130,11 @@ class Pure(unittest.TestCase):
                 self.assertEqual(ast_lessons.check_source(fh.read()), [], f"the plugin passes its own check: {path}")
 
     def test_hindsight_record_is_a_pending_correction(self):
-        row = judge.record({"kind": "hindsight", "session": "H", "reply": "x" * 700 + "THE END", "follow": "f"},
-                           "error")
+        row = judge.record({"kind": "hindsight", "session": "H", "reply": "x" * 700 + "THE END", "prompt": "p",
+                            "follow": "f"}, "error")
         self.assertEqual((row["verdict"], row["kind"]), ("correction", "hindsight"))
         self.assertTrue(row["prompt"].endswith("THE END") and len(row["prompt"]) == 600)
-        fine = judge.record({"kind": "hindsight", "session": "H", "reply": "r", "follow": "f"}, "fine")
+        fine = judge.record({"kind": "hindsight", "session": "H", "reply": "r", "prompt": "p", "follow": "f"}, "fine")
         self.assertNotIn("prompt", fine, "only an error keeps text")
         self.assertEqual(judge.parse("Error.", judge.HINDSIGHT_VERDICTS), "error")
         self.assertEqual(judge.parse("correction", judge.HINDSIGHT_VERDICTS), "")
@@ -230,22 +260,38 @@ class Transcript(unittest.TestCase):
         transcript(self.tp, [typed("q0"), said("It changed 3 lines."), typed("no -- it was 156"),
                              {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
                                                                             "input": {"command": "git show --stat"}}]}},
+                             {"type": "user", "message": {"content": [{"type": "tool_result",
+                                                                       "content": "8 files changed, 156 lines"}]}},
                              said("You're right: 156 lines.")])
-        reply, follow = capture.previous_and_follow(self.tp)
+        reply, prompt, follow = capture.previous_and_follow(self.tp)
         self.assertEqual(reply, "It changed 3 lines.")
-        self.assertIn("USER NEXT: no -- it was 156", follow)
+        self.assertEqual(prompt, "no -- it was 156")
         self.assertIn("git show --stat", follow)
+        self.assertIn("156 lines]", follow, "this turn's tool RESULTS reach the judge")
         self.assertIn("You're right: 156 lines.", follow)
 
     def test_no_previous_turn_no_hindsight(self):
         transcript(self.tp, [typed("q0"), said("only one turn")])
-        self.assertEqual(capture.previous_and_follow(self.tp), ("", ""))
+        self.assertEqual(capture.previous_and_follow(self.tp), ("", "", ""))
         self.assertIsNone(hindsight.job_for({"transcript_path": self.tp, "session_id": "S"}))
+
+    def test_harness_or_empty_prompt_is_not_a_follow_up(self):
+        for p in ("<command-name>/clear</command-name>", "Stop hook feedback: keep going"):
+            transcript(self.tp, [typed("q0"), said("a"), typed(p), said("b")])
+            self.assertEqual(capture.previous_and_follow(self.tp), ("", "", ""), p)
 
     def test_hindsight_skips_stop_hook_active(self):
         transcript(self.tp, [typed("q0"), said("a"), typed("q1"), said("b")])
         self.assertIsNone(hindsight.job_for({"transcript_path": self.tp, "stop_hook_active": True}))
         self.assertEqual(hindsight.job_for({"transcript_path": self.tp, "session_id": "S"})["kind"], "hindsight")
+
+    def test_same_reply_judged_once_across_a_task_notification(self):
+        note = {"type": "user", "origin": {"kind": "task-notification"},
+                "message": {"content": "<task-notification>x</task-notification>"}}
+        transcript(self.tp, [typed("q0"), said("A0"), typed("q1"), said("A1")])
+        self.assertIsNotNone(hindsight.job_for({"transcript_path": self.tp, "session_id": "N"}))
+        transcript(self.tp, [typed("q0"), said("A0"), typed("q1"), said("A1"), note, said("A2")])
+        self.assertIsNone(hindsight.job_for({"transcript_path": self.tp, "session_id": "N"}), "A0 already judged")
 
     def test_interrupted_turn_is_judged(self):
         transcript(self.tp, [typed("clean up"), said("Cleaning the cache directory."),
@@ -352,7 +398,7 @@ class EndToEnd(unittest.TestCase):
         path = os.path.join(self.home, "corrections.jsonl")
         self.assertTrue(self.wait_for(path))
         time.sleep(0.2)
-        self.assertEqual(store.read_jsonl(path)[0]["verdict"], "error")
+        self.assertEqual(store.read_jsonl(path)[0]["verdict"], "judge-error")
         pend = subprocess.run([sys.executable, CLI, "pending"], capture_output=True, text=True, env=self.env, check=False).stdout
         self.assertIn("did not answer 1 of the last 1", pend)
 
@@ -397,7 +443,7 @@ class EndToEnd(unittest.TestCase):
         path = os.path.join(self.home, "corrections.jsonl")
         self.assertTrue(self.wait_for(path))
         time.sleep(0.2)
-        self.assertEqual(store.read_jsonl(path)[0]["verdict"], "error")
+        self.assertEqual(store.read_jsonl(path)[0]["verdict"], "judge-error")
 
     def test_dismiss_requires_a_known_correction(self):
         r = subprocess.run([sys.executable, CLI, "dismiss", "nope"], capture_output=True, text=True, env=self.env, check=False)
@@ -446,12 +492,28 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("YOUR mistake", out)
         self.assertIn("arc-cdp --help", out)
 
+    def test_hindsight_off_and_judging_guard(self):
+        transcript(self.tp, [typed("q0"), said("a"), typed("q1"), said("b")])
+        for extra in ({"LESSON_REFLEX_HINDSIGHT": "0"}, {"LESSON_REFLEX_JUDGING": "1"}):
+            r = run(os.path.join(HOOKS, "hindsight.py"), {"transcript_path": self.tp, "session_id": "OFF2"},
+                    dict(self.env, **extra))
+            self.assertEqual((r.returncode, r.stdout), (0, ""))
+        time.sleep(0.5)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "hindsight-seen.jsonl")))
+
     def test_failures_can_be_turned_off(self):
         ev = {"tool_name": "Bash", "tool_input": {"command": "x --bad"}, "error": "e", "session_id": "OFF"}
         r = run(os.path.join(HOOKS, "failure.py"), ev, dict(self.env, LESSON_REFLEX_FAILURES="0"))
         self.assertEqual(r.returncode, 0)
         time.sleep(0.5)
         self.assertFalse(os.path.exists(os.path.join(self.home, "failures-seen.jsonl")), "nothing judged or recorded")
+
+    def test_ast_state_is_private(self):
+        ev = {"tool_name": "Write", "session_id": "P1",
+              "tool_input": {"file_path": os.path.join(self.d.name, "t.py"), "content": "x = redact(s[:9])\n"}}
+        run(os.path.join(HOOKS, "ast_reflex.py"), ev, self.env)
+        mode = os.stat(os.path.join(self.home, "ast-fired.json")).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
 
     def test_ast_reflex_warns_before_the_edit(self):
         target = os.path.join(self.d.name, "tool.py")

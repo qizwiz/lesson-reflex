@@ -71,9 +71,9 @@ def pending():
         print(f"{c['id']}  {str(c.get('prompt', ''))[:110]!r}")
     print(f"-- {len(rows)} correction(s) with no lesson yet")
     recent = corrections[-50:]
-    errors = [c for c in recent if c.get("verdict") in ("error", "busy")]
+    errors = [c for c in recent if c.get("verdict") in ("judge-error", "error", "busy")]  # "error": rows before 0.3
     if errors:
-        print(f"-- the judge did not answer {len(errors)} of the last {len(recent)} prompts; latest: "
+        print(f"-- the judge did not answer {len(errors)} of the last {len(recent)} judgements; latest: "
               f"{errors[-1].get('error') or errors[-1].get('verdict')}")
     return 0
 

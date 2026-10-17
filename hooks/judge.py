@@ -127,14 +127,17 @@ def run_judge(job, run=subprocess.run, base=None):
         if custom:
             stdin = json.dumps(job)
         elif kind == "hindsight":
-            stdin = HINDSIGHT_PROMPT.format(reply=job["reply"], follow=job["follow"])
+            follow = (f"USER NEXT: {store.mask(str(job.get('prompt', '')))[:2000]}\n\n"
+                      f"ASSISTANT NEXT (tool calls, results, reply): {store.mask(str(job['follow']))[-2500:]}")
+            stdin = HINDSIGHT_PROMPT.format(reply=store.mask(str(job["reply"]))[-2000:], follow=follow)
         elif kind == "failure":
             stdin = FAILURE_PROMPT.format(tool=job.get("tool", ""),
                                           description=store.mask(str(job.get("description", "")))[:300],
                                           action=store.mask(str(job["action"]))[-4000:],
                                           error=store.mask(str(job["error"]))[:2000])
         else:
-            stdin = PROMPT.format(previous=job["previous"], prompt=job["prompt"])
+            stdin = PROMPT.format(previous=store.mask(str(job["previous"]))[-1500:],
+                                  prompt=store.mask(str(job["prompt"]))[:2000])
         with tempfile.TemporaryDirectory() as cwd:
             r = run(argv, input=stdin, capture_output=True, text=True, errors="replace", timeout=TIMEOUT,
                     env=env, cwd=cwd)
@@ -153,6 +156,15 @@ def run_judge(job, run=subprocess.run, base=None):
     return (verdict, "") if verdict else ("", f"judge answered off-format ({len(r.stdout or '')} characters)")
 
 
+def corrected_already(job):
+    """Did the correction judge already flag the user's message that started this turn? Then the hindsight error
+    about the reply before it is the same mistake, and is not announced a second time."""
+    said = store.mask(str(job.get("prompt", "")))[:600]
+    return any(r.get("kind", "correction") == "correction" and r.get("verdict") == "correction"
+               and r.get("session") == job.get("session") and r.get("prompt") == said
+               for r in store.read_jsonl(store.path("corrections.jsonl"))[-200:])
+
+
 def record(job, verdict, error=""):
     """Ledger the verdict. Only a correction keeps text; it also goes to the session's inbox. A hindsight "error"
     is recorded as a correction of kind hindsight, keeping the end of the reply that was wrong, so the inbox,
@@ -160,7 +172,9 @@ def record(job, verdict, error=""):
     kind = job.get("kind", "correction")
     if (kind, verdict) in (("hindsight", "error"), ("failure", "mistake")):
         verdict = "correction"
-    row = {"id": store.new_id(), "session": job.get("session", ""), "kind": kind, "verdict": verdict or "error",
+    if kind == "hindsight" and verdict == "correction" and corrected_already(job):
+        verdict = "duplicate"  # the user already corrected this reply; one announcement, not two
+    row = {"id": store.new_id(), "session": job.get("session", ""), "kind": kind, "verdict": verdict or "judge-error",
            "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     if error:
         row["error"] = error
@@ -173,7 +187,7 @@ def record(job, verdict, error=""):
             text = store.mask(str(job.get("prompt", "")))[:600]
         row["prompt"] = text
         if kind == "failure":
-            row["program"] = str(job.get("program", ""))[:80]
+            row["program"] = store.mask(str(job.get("program", "")))[:80]
     store.append_jsonl(store.path("corrections.jsonl"), row)
     if verdict == "correction":
         store.add_to_inbox(row["session"], row["id"])
@@ -200,7 +214,8 @@ def main():
         return 0
     if not isinstance(job, dict):
         return 0
-    needs = {"hindsight": ("reply", "follow"), "failure": ("action", "error")}.get(job.get("kind"), ("prompt", "previous"))
+    needs = {"hindsight": ("reply", "prompt", "follow"), "failure": ("action", "error")}.get(str(job.get("kind", "")),
+                                                                                           ("prompt", "previous"))
     if any(k not in job for k in needs):
         return 0
     try:

@@ -14,7 +14,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import store  # noqa: E402
-KEEP = 16
+
+KEEP = 64
 
 
 def is_python(path, text):
@@ -85,34 +86,32 @@ def handle(ev, check=None, state_path=None, read=_read):
         return ""
     session = str(ev.get("session_id") or "")
     state_path = state_path or store.path("ast-fired.json")
-    store.ensure_home()
-    try:
-        with open(state_path) as fh:
-            state = json.load(fh)
-        state = state if isinstance(state, dict) else {}
-    except (OSError, ValueError):
-        state = {}
-    fired = set(state.get(session) or [])
     path = str(ti.get("file_path"))
     msgs = []
-    for c, ln, m, text in found:
-        key = f"{path}|{c}|{text}"
-        if key in fired:
-            continue
-        fired.add(key)
-        msgs.append(f"[ast-lesson {c}] {os.path.basename(path)}:{ln}: {m}\n    {text[:160]}")
-    if not msgs:
-        return ""
-    state = {k: v for k, v in state.items() if k != session}
-    state[session] = sorted(fired)
-    state = dict(list(state.items())[-KEEP:])
-    try:
-        tmp = f"{state_path}.{os.getpid()}"
-        with open(tmp, "w") as fh:
-            json.dump(state, fh)
-        os.replace(tmp, state_path)
-    except OSError:
-        pass
+    # read-modify-write under the store's lock, written 0600 through write_atomic: concurrent sessions keep each
+    # other's entries, and the file (paths and source lines) is as private as the rest of the store
+    with store.locked("ast.lock"):
+        try:
+            with open(state_path) as fh:
+                state = json.load(fh)
+            state = state if isinstance(state, dict) else {}
+        except (OSError, ValueError):
+            state = {}
+        fired = set(state.get(session) or [])
+        for c, ln, m, text in found:
+            key = f"{path}|{c}|{text}"
+            if key in fired:
+                continue
+            fired.add(key)
+            msgs.append(f"[ast-lesson {c}] {os.path.basename(path)}:{ln}: {m}\n    {text[:160]}")
+        if not msgs:
+            return ""
+        state = {k: v for k, v in state.items() if k != session}
+        state[session] = sorted(fired)
+        try:
+            store.write_atomic(state_path, json.dumps(dict(list(state.items())[-KEEP:])))
+        except OSError:
+            pass
     return "\n".join(msgs) + "\n(A structural lesson from past mistakes; fix it in this edit if it applies.)"
 
 

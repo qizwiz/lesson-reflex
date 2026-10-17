@@ -77,7 +77,9 @@ secret's shape, never its value.
 
 ## The judge
 
-The judge answers two questions, each in the background so nothing waits on it.
+The judge answers three questions, each in the background so nothing waits on it. Everything the default judge is
+sent is masked for credential-shaped tokens first and cut after; a custom judge (`LESSON_REFLEX_JUDGE`, below)
+receives the job exactly as built, unmasked and uncut.
 
 **Correction** (UserPromptSubmit): each prompt you type, once Claude has said or done something since your previous prompt, starts one judge call
 **in the background**, so your prompt never waits on it. At most 3 run at once; a prompt that arrives while all 3 are busy is recorded as `busy`
@@ -98,34 +100,42 @@ The verdict takes several seconds (about 3 to 6 in the author's runs). It is ann
 may be later in the same turn or in the next one; subagents are never told. A correction that is never announced
 still shows up in `lesson pending`.
 
-**Tool failure** (PostToolUseFailure): the failed action, its description and the error (credential-shaped tokens
-masked first, then cut to 4000, 300 and 2000 characters) go to the judge, which answers `mistake`, `expected` or
-`environment`. A call interrupted by the user is skipped; that is a correction, which the correction capture reads.
+**Tool failure** (PostToolUseFailure, for Bash, Edit, MultiEdit and Write only -- the tools a lesson can attach
+to): the failed action, its description and the error (masked, then cut to 4000, 300 and 2000 characters) go to the
+judge, which answers `mistake`, `expected` or `environment`. A call interrupted by the user is skipped; that is a
+correction, which the correction capture reads. The "program" a Bash failure is counted under is its first command
+word after wrappers such as `sudo`, `env`, `time` and `timeout`.
 Measured on 40 of the author's real failed Bash calls, hand-labelled before any model saw them (6 were mistakes):
 the default sonnet judge caught all 6, and also called 11 of the 34 benign failures mistakes. (That sample kept only
 each call's description and a cut error, not the command itself.) Expect most real mistakes to be caught and some
 noise; each false alarm costs one `lesson dismiss`. Set `LESSON_REFLEX_FAILURES=0` to turn the failure capture off.
 
-**Hindsight** (Stop): at the end of each turn, the reply that ended the *previous* turn (up to 1500 characters) and what
-followed it (your message, then this turn's tool calls and reply, up to 1500 characters) go to the judge, which
-answers `error`, `fine` or `unclear`. An `error` is announced at Claude's next tool call and listed by `lesson pending`
-like a correction. The hindsight hook never blocks the end of a turn.
+**Hindsight** (Stop): at the end of a turn you started, the judge gets what Claude said *and did* in the previous
+turn -- its text and its tool calls, including their arguments (shell commands, file contents written), up to the
+last 2000 characters -- and what followed: your message (up to 2000 characters), then this turn's tool calls, their
+results and its reply (the last 2500 characters). Everything is masked for credential-shaped tokens first, then cut.
+The judge answers `error`, `fine` or `unclear`. An `error` is announced at Claude's next tool call and listed by
+`lesson pending` like a correction; if you already corrected that reply yourself, it is recorded as a `duplicate` and
+not announced twice. Each reply is judged once. A turn is skipped when it was not started by something you typed (a
+harness message, an image alone) or when the newest 400 KB of the transcript does not reach back to the previous
+turn. The hindsight hook never blocks the end of a turn.
 
 Each judge call is a small model request. To change the judge:
 
 - `LESSON_REFLEX_MODEL=haiku`: cheaper, noisier.
 - `LESSON_REFLEX_FAILURES=0`: no tool-failure judgements.
+- `LESSON_REFLEX_HINDSIGHT=0`: no hindsight judgements.
 - `LESSON_REFLEX_JUDGE="your-command"`: any program that reads the job as JSON on stdin and prints one word. A
   correction job is `{"session","prompt","previous","cwd"}` and wants `correction`, `request` or `other`; a hindsight
-  job is `{"kind":"hindsight","session","reply","follow","cwd"}` and wants `error`, `fine` or `unclear`; a failure
+  job is `{"kind":"hindsight","session","reply","prompt","follow","cwd"}` and wants `error`, `fine` or `unclear`; a failure
   job is `{"kind":"failure","session","tool","program","action","description","error","cwd"}` and wants `mistake`,
   `expected` or `environment`. Only the leading word of its output is read. A relative path
   such as `./judge` is resolved against the session's working directory when the prompt was sent; quote a path
   containing spaces.
 
 If the judge fails (CLI missing, auth, timeout, an answer that isn't one of its three words), the job is
-recorded as `error` with the reason (never the judge's output), and `lesson pending` reports how many of the recent
-prompts went unjudged.
+recorded as `judge-error` with the reason (never the judge's output), and `lesson pending` reports how many of the
+recent judgements failed.
 
 ### How well it judges
 
@@ -133,10 +143,12 @@ The author hand-labelled 29 of their own prompts, 5 of them corrections, before 
 - sonnet caught 3 of the 5 corrections, with no false alarms
 - haiku caught 4, and flagged 2 ordinary requests as corrections
 
-For hindsight, the author labelled 120 of their own past turns with a stronger judge, Jev, and read the 5 most
-confident "error" labels by hand; all 5 were real. On 20 turns Jev labelled `error` and 20 it labelled `fine`, the
-default sonnet judge said `error` on 8 of the 20 errors (4 of the 5 clearest) and on 1 of the 20 fine turns. So
-expect its announcements to be mostly right, and expect it to miss more than half of the subtler errors.
+For hindsight, the author had a different, stronger judge label 120 of their own past turns: it labelled 88 (26
+error, 54 fine, 8 unclear) and declined 32 for privacy. The 5 most confident "error" labels, read by hand, were all
+real. On 20 turns it labelled `error` and 20 it labelled `fine`, the default sonnet judge said `error` on 8 of the 20
+errors (4 of the 5 clearest) and on 1 of the 20 fine turns. That measurement fed sonnet the reply's final text (no
+tool calls) and a follow-up that included tool results, close to but not the same as what the plugin sends. Expect
+its announcements to be mostly right, and expect it to miss more than half of the subtler errors.
 
 These are small samples from one person, and the transcripts are private, so the data is not in this repository. To
 score it on your own sessions: every verdict is in `corrections.jsonl`, and every `lesson dismiss` records a
@@ -151,22 +163,32 @@ private (0700) and its files 0600. Delete the directory to start over.
 |---|---|
 | `lessons.jsonl` | your lessons |
 | `corrections.jsonl` | one row per judgement (id, session id, kind, verdict, time). Text is kept **only** for a correction (your prompt's first 600 characters), a hindsight error (the last 600 characters of the reply that was wrong) or a tool-failure mistake (the action's first 600 characters), with credential-shaped tokens masked before it is cut. |
-| `failures-seen.jsonl` | one row per program per session already sent to the failure judge (a hash of the session id and the program name) |
+| `failures-seen.jsonl` | one row per program per session already sent to the failure judge: a hash of the session id and a hash of the program name. It grows by a row per new program per session and is not trimmed (only the last 2000 rows are read). |
+| `hindsight-seen.jsonl` | one row per reply already sent to the hindsight judge (hashes only), so a reply is judged once |
 | `ast-fired.json` | which structural findings each recent session has already been shown |
 | `dismissed.txt` | ids of corrections you dismissed |
 | `inbox/` | corrections waiting to be announced; each is removed once announced or closed. A session that ends before its next tool call leaves its file behind; `lesson pending` still lists the correction. |
 | `fired.json` | which lessons have already fired, for the 256 most recent entries (a session's main thread and each subagent are separate entries) |
 | `*.lock` | lock files that keep concurrent sessions and judges from overwriting each other |
 
-`corrections.jsonl` grows by one row per judgement (up to two per turn), and nothing trims it.
+`corrections.jsonl` grows by one row per judgement -- a correction and a hindsight judgement per turn at most, plus
+one per newly failing program -- and nothing trims it.
 
 ## Structural lessons
 
 `hooks/ast_lessons.py` ships one check, `slice-into-redact`: text cut (`x[:N]`) before it reaches a masking function
 (`redact`, `mask`, `scrub`, `sanitize`, `anonymize`, `mask_secrets`), so a credential straddling the cut becomes a
 fragment too short to recognise and is stored or sent. It follows the value through local names, lists it is
-appended to, tuple unpacking, and functions that return cut text, within one file. That bug recurred five times
-while this plugin was being built, which is why it is the first. To add a check, write a function from source text to
+appended to, tuple unpacking, loop and comprehension variables, and functions that return cut text, within one
+file; a use only sees what was bound before it. That bug recurred five times while this plugin was being built,
+which is why it is the first.
+
+It is a heuristic over one file, and it is wrong both ways:
+- **False positives:** any function named like a masker counts, so a `mask()` that formats a card number for
+  display, fed its last four digits, is flagged (the one finding across 548 of the author's Python files).
+  `df.mask(df[:5] > 0)` is flagged too.
+- **False negatives:** cuts made in another module or by a library (`textwrap.shorten`), cuts that reach the masker
+  through an object attribute or a dict entry, and walrus assignments are not followed. To add a check, write a function from source text to
 `[(line, message)]` and add it to `CHECKS`. Run it directly with `python3 hooks/ast_lessons.py check FILE...`.
 
 ## Prior art

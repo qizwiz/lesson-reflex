@@ -2,7 +2,8 @@
 
 Everything lives under $LESSON_REFLEX_HOME (default ~/.claude/lesson-reflex), created private (0700 / 0600):
   lessons.jsonl      one lesson per line: tool, needle, lesson, source, at
-  corrections.jsonl  one row per judged prompt: id, session, verdict, at -- plus the prompt text ONLY for corrections
+  corrections.jsonl  one row per judgement: id, session, kind, verdict, at -- text (masked, then cut) only when it is
+                     announced: a correction, a hindsight error or a tool-failure mistake
   dismissed.txt      correction ids marked "the judge misread this"
   inbox/<session>    correction ids waiting to be announced to that session (consumed when announced)
   fired.json         {session: [keys already injected]} -- each lesson fires once per session
@@ -54,7 +55,7 @@ def ensure_home():
 
 def read_jsonl(p):
     """Dict rows of a JSONL file; a corrupt or non-object line costs only itself, a missing file is empty."""
-    rows = []
+    rows: list[dict] = []
     try:
         with open(p, errors="replace") as fh:
             lines = fh.readlines()
@@ -127,6 +128,15 @@ def carries_secret(text):
 
 
 def mask(text):
+    """PURE: mask_once until nothing changes -- a replacement can create a token boundary that was not there before
+    (an ASIA... key directly followed by an sk-... key), so one pass can leave a recognisable key behind."""
+    prev, out = None, text or ""
+    while out != prev:
+        prev, out = out, mask_once(out)
+    return out
+
+
+def mask_once(text):
     """PURE: TEXT with every credential-shaped token (the shapes carries_secret knows) replaced by <secret>. Callers
     mask the WHOLE text and only then cut it -- cutting first can split a token below the length that is recognised."""
     text = text or ""
@@ -234,6 +244,19 @@ def add_to_inbox(session, cid):
         fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as fh:
             fh.write(cid + "\n")
+
+
+def spawn_judge(job):
+    """Hand JOB to judge.py in a detached background process, so no hook ever waits on a model call."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "judge.py")],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    if proc.stdin is not None:
+        proc.stdin.write(json.dumps(job).encode())
+        proc.stdin.close()
 
 
 def inbox_path(session):

@@ -7,10 +7,10 @@
     {
       "name": "lesson-reflex",
       "source": "./",
-      "description": "Turn a correction into a lesson that fires at the ACTION that caused it: a background judge spots when you correct Claude, Claude records a (tool, trigger text, lesson) row, and a PreToolUse hook injects it the next time Claude is about to do that thing."
+      "description": "Claude Code learns from its mistakes at the action: your corrections, its failed tool calls, replies that turned out wrong in hindsight, and structural code checks become lessons injected the next time it is about to repeat them."
     }
   ],
   "metadata": {
-    "description": "lesson-reflex: corrections become lessons that fire at the action"
+    "description": "lesson-reflex: mistakes become lessons that fire at the action"
   }
 }

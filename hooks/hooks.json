@@ -53,7 +53,8 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/failure.py\"",
             "timeout": 5
           }
-        ]
+        ],
+        "matcher": "Bash|Edit|MultiEdit|Write"
       }
     ]
   }
