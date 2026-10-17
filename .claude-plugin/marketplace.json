@@ -1,0 +1,16 @@
+{
+  "name": "lesson-reflex",
+  "owner": {
+    "name": "qizwiz"
+  },
+  "plugins": [
+    {
+      "name": "lesson-reflex",
+      "source": "./",
+      "description": "Turn a correction into a lesson that fires at the ACTION that caused it: a background judge spots when you correct Claude, Claude records a (tool, trigger text, lesson) row, and a PreToolUse hook injects it the next time Claude is about to do that thing."
+    }
+  ],
+  "metadata": {
+    "description": "lesson-reflex: corrections become lessons that fire at the action"
+  }
+}
